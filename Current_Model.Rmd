@@ -28,22 +28,7 @@ library(reticulate)
 library(caret)
 library(MLmetrics)
 
-# Open Athena connection
-snow_snow <- DBI::dbConnect(
-  odbc::odbc(),
-  UID    = keyring::key_list("ATHENA")[1,2],
-  PWD    = keyring::key_get("ATHENA", keyring::key_list("ATHENA")[1,2]),
-  Server = "rl51365.snowflakecomputing.com",
-  Warehouse = "AH_WAREHOUSE",
-  Database = "ATHENAHEALTH",
-  Schema = "ATHENAONE",
-  Driver = "SnowflakeDSIIDriver" #MAKE SURE THIS IS THE RIGHT NAME
-)
-
-
-#use_python("C:/Users/AlexanderDonald/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Python 3.10")
-```
-
+# Connect to snowflake
 
 # Load in with Query
 ```{sql connection = snow_snow, output.var = "slots"}
