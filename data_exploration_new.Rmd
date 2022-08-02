@@ -32,17 +32,7 @@ library(data.table)
 library(zipcodeR)
 library(geodist)
 
-# Open Athena connection
-snow_snow <- DBI::dbConnect(
-  odbc::odbc(),
-  UID    = keyring::key_list("ATHENA")[1,2],
-  PWD    = keyring::key_get("ATHENA", keyring::key_list("ATHENA")[1,2]),
-  Server = "rl51365.snowflakecomputing.com",
-  Warehouse = "AH_WAREHOUSE",
-  Database = "ATHENAHEALTH",
-  Schema = "ATHENAONE",
-  Driver = "SnowflakeDSIIDriver" #MAKE SURE THIS IS THE RIGHT NAME
-)
+#Create snowflake connection
 ```
 
 
