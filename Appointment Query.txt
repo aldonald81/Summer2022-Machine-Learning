@@ -1,0 +1,164 @@
+WITH DF AS ( --GET APPOINTMENT INFO
+SELECT DISTINCT
+a.claimid
+,a.appointmentdate
+,a.appointmentstarttime
+,a.parentappointmentid
+,a.appointmentid
+,a.appointmentstatus
+,ap.duration
+,a.appointmentcreateddatetime
+,(CASE WHEN D.DEPARTMENTNAME LIKE 'Tryon Med %' Then (REPLACE(D.DEPARTMENTNAME, 'Tryon Med - ', ''))
+    when D.DEPARTMENTNAME LIKE '%COVID%' then 'Tryon Med COVID Clinic - Pineville'
+    when D.DEPARTMENTNAME = 'Tryon Med-Asheville' Then 'Asheville'
+    when D.DEPARTMENTNAME LIKE '%SATELLITE%' then 'Tryon Med Satellite-Uptown 7th' 
+    else D.DEPARTMENTNAME END)
+    AS DEPARTMENTNAME
+,pt.patientid
+,pt.enterpriseid
+,DATEDIFF(year, pt.dob, a.appointmentdate) as age
+,pt.sex
+,LEFT(pt.zip, 5) as zip
+,p.schedulingname
+,concat(p.providerlastname, ', ', p.providerfirstname) as physician_name
+,p.specialty
+,p.providertypecategory
+,p.providertype
+,ap.appointmenttypename
+,ap.appointmenttypeclass
+,A.APPOINTMENTCANCELLEDDATETIME AS APTCANCELLEDDATE
+,DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) AS TIMETOCANCEL
+,a.appointmentcancelreason
+,a.frozenyn
+,a.appointmentfrozenreason
+from "ATHENAHEALTH"."ATHENAONE"."APPOINTMENT" a       
+left join "ATHENAHEALTH"."ATHENAONE"."APPOINTMENTTYPE" ap on a.appointmenttypeid = ap.appointmenttypeid
+left join "ATHENAHEALTH"."ATHENAONE"."DEPARTMENT" d on a.departmentid = d.departmentid
+left join "ATHENAHEALTH"."ATHENAONE"."PROVIDER" p on a.schedulingproviderid = p.providerid
+left join "ATHENAHEALTH"."ATHENAONE"."PATIENT" pt on a.patientid = pt.patientid
+where year(a.appointmentdate) >= year(current_date()) - 2
+and a.appointmentdate <= current_date()
+AND (UPPER(DEPARTMENTNAME) LIKE 'TRYON MED%' OR UPPER(DEPARTMENTNAME) LIKE 'TMP%')
+and p.entitytype = 'Person'
+and (pt.patientstatus not in ('d', 'i') or pt.patientstatus is null)
+and upper(p.schedulingname) not like '%TEST%'
+and (pt.testpatientyn = 'N' or pt.testpatientyn is null)
+and APPOINTMENTDATE BETWEEN '2022-05-01' AND '2022-05-31'
+AND SCHEDULINGname = 'Belgrave_Enrico'
+AND APPOINTMENTSTATUS LIKE '4%'
+), 
+DF0 AS ( -- FREEZE COMPLETED APPOINTMENTS TO EXCLUDE FROM INDEX
+SELECT DISTINCT
+DF.*
+,CASE WHEN APPOINTMENTSTATUS LIKE '4%' THEN '1' END AS KEEP -- NOT NECESSARY, BUT CREATED A KEEP FLAG FOR COMPLETED APPOINTMENTS
+from DF
+),
+DF1 AS ( -- BEGIN INDEXING
+SELECT DISTINCT
+D.*
+,CASE WHEN KEEP IS NULL THEN concat(D.appointmentdate, D.schedulingname, D.appointmentstarttime) END AS SLOT_ID -- CREATE SLOT ID TO INDEX ON
+,CASE WHEN KEEP IS NULL THEN Row_number() over (partition by SLOT_ID order by D.appointmentcreateddatetime DESC) END as SLOT_IDX -- ORDER SLOT_ID BY DESC APPOINTMENT CREATED DATE -> TO GET MOST RECENT SLOT ACTION
+FROM DF0 D
+),
+DF2 AS ( -- CHECK STATUS OF PREVIOUS SLOT ACTION, ONLY IF THE LAST ACTION IS OPEN SLOT
+SELECT
+DF1.*
+,CASE WHEN KEEP IS NULL THEN LEAD(APPOINTMENTSTATUS,1, APPOINTMENTSTATUS)
+OVER (PARTITION BY [APPOINTMENTSTARTTIME],[SCHEDULINGNAME], [APPOINTMENTDATE]
+ORDER BY SLOT_IDX DESC) END AS nextStatusType -- ASSIGN A "LAST STATUS" TO OPEN SLOT IDS
+FROM DF1
+),
+DF3 AS ( -- REASSIGN NEW INDEXING NUMBER IN CASES WHERE AN OPEN SLOT WAS GENERATED AFTER A CANCELLATION
+SELECT DF2.*,
+CASE 
+  WHEN APPOINTMENTSTATUS = 'x - Cancelled' AND SLOT_IDX <= 2 AND nextStatusType = 'o - Open Slot' THEN 0
+  ELSE SLOT_IDX
+END AS importance
+FROM DF2
+),
+DF4 AS ( -- SELECT THE. MINIMUM SLOT INDEX WITH NEW INDEXING -> WILL NOW ONLY COUNT TRUE OPEN SLOTS AS "OPEN"
+SELECT 
+SLOT_ID,
+MIN(IMPORTANCE) AS IMPORTANCE_ID
+FROM df3 
+GROUP BY SLOT_ID
+),
+NEW AS( -- UNION SELECTION USING NEW INDEX WITH PREVIOUSLY FROZEN COMPLETED APPOINTMENTS
+SELECT DISTINCT
+claimid
+,appointmentdate
+,appointmentstarttime
+,parentappointmentid
+,appointmentid
+,appointmentstatus
+,duration
+,appointmentcreateddatetime
+,DEPARTMENTNAME
+,patientid
+,enterpriseid
+,age
+,sex
+,zip
+,schedulingname
+,physician_name
+,specialty
+,providertypecategory
+,providertype
+,appointmenttypename
+,appointmenttypeclass
+,APTCANCELLEDDATE
+,TIMETOCANCEL
+,appointmentcancelreason
+,frozenyn
+,appointmentfrozenreason
+,KEEP
+FROM DF3
+JOIN DF4 ON DF4.SLOT_ID = DF3.SLOT_ID
+WHERE IMPORTANCE_ID = IMPORTANCE
+  UNION ALL
+SELECT DISTINCT -- ISOLATES COMPLETED APPOINTMENTS TO AVOID DUPLUCATES, USING KEEP FLAG
+DF0.*
+FROM DF0 
+WHERE KEEP IS NOT NULL
+),
+DF5 AS ( -- CREATE AM/PM FLAD FOR HALF DAYS, AND CREATE SLOT STATUS (BASED ON TIME TO CANCEL AND APPOINTMENT STATUS) CATEGORIES TO ATTENDED, CANCELLED BEFORE, CANCELLED SAME DAY, NO CALL NO SHOW, OR UNFILLED SLOT
+SELECT DISTINCT
+N.*
+,TIME(N.APPOINTMENTSTARTTIME) AS APPOINTMENTSTARTTIME_military
+,HOUR(TIME(N.APPOINTMENTSTARTTIME)) AS APPOINTMENTSTARTTIME_hour 
+,(case when time(N.appointmentstarttime) < '14:00:00' 
+    then 'AM' 
+    ELSE 'PM' END) AS AMPMflag
+,(CASE
+    WHEN (DATEDIFF(day, N.APTCANCELLEDDATE, N.APPOINTMENTDATE) = 0 
+          AND
+          (N.APPOINTMENTCANCELREASON != 'PATIENT NO SHOW'
+          OR UPPER(N.APPOINTMENTCANCELREASON) != 'NO SHOW NO CALL'))
+       THEN 'Same Day Cancellation'
+    WHEN DATEDIFF(day, N.APTCANCELLEDDATE, N.APPOINTMENTDATE) > 0
+       THEN 'Cancelled Before Scheduled Appointment'
+    WHEN (DATEDIFF(day, N.APTCANCELLEDDATE, N.APPOINTMENTDATE) < 0
+          OR
+          UPPER(N.APPOINTMENTCANCELREASON) IN ('PATIENT NO SHOW', 'NO SHOW NO CALL'))
+       THEN 'No Call, No Show'
+    WHEN N.APPOINTMENTSTATUS = '4 - Charge Entered'
+  THEN 'Attended'
+        ELSE 'Unfilled Slot'
+END) AS APPOINTMENT_STATUS_CAT
+FROM NEW N
+)
+SELECT DISTINCT -- BRING IN E&MS FOR AVERAGE E&M LEVEL
+D.*
+,C.procedurecode
+,C.procedurecodedescription
+,C.procedurecodegroup
+FROM DF5 D
+LEFT JOIN
+(SELECT DISTINCT -- SEPARATED AS SUCH TO AVOID LOSS OF APPOINTMENTS W/ NO ASSOCIATED BILLING
+T.CLAIMID
+,t.procedurecode
+,p.procedurecodedescription
+,p.procedurecodegroup
+FROM "ATHENAHEALTH"."ATHENAONE"."TRANSACTION" T
+JOIN "ATHENAHEALTH"."ATHENAONE"."PROCEDURECODE" P ON P.PROCEDURECODE = T.PROCEDURECODE
+WHERE UPPER(PROCEDURECODEDESCRIPTION) LIKE 'OFFICE/OUT%') C ON D.CLAIMID = C.CLAIMID

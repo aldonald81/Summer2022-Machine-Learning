@@ -1,0 +1,1129 @@
+---
+title: "Current Model"
+output: 
+    html_document: 
+        code_folding: hide
+date: '2022-06-30'
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Modeling the liklihood of a specific FILLED slot being a 'No-Show'
+### Looking to predict whether a slot between the hours of 7AM and 5PM during the weekday will go as a No-Show based on time, day, patient info, etc
+
+## Loading libraries
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+#library(Tryon)
+library(DBI)
+library(ggplot2)
+library(lubridate)
+library(plotly)
+library(klaR)
+library(InformationValue)
+library(reticulate)
+library(caret)
+library(MLmetrics)
+
+# Open Athena connection
+snow_snow <- DBI::dbConnect(
+  odbc::odbc(),
+  UID    = keyring::key_list("ATHENA")[1,2],
+  PWD    = keyring::key_get("ATHENA", keyring::key_list("ATHENA")[1,2]),
+  Server = "rl51365.snowflakecomputing.com",
+  Warehouse = "AH_WAREHOUSE",
+  Database = "ATHENAHEALTH",
+  Schema = "ATHENAONE",
+  Driver = "SnowflakeDSIIDriver" #MAKE SURE THIS IS THE RIGHT NAME
+)
+
+
+#use_python("C:/Users/AlexanderDonald/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Python 3.10")
+```
+
+
+# Load in with Query
+```{sql connection = snow_snow, output.var = "slots"}
+
+with df as (SELECT
+a.parentappointmentid
+,a.appointmentid
+,a.appointmentdate
+,a.appointmentstarttime
+,a.appointmentcreateddatetime
+,(CASE WHEN D.DEPARTMENTNAME LIKE 'Tryon Med %' Then (REPLACE(D.DEPARTMENTNAME, 'Tryon Med - ', ''))
+    when D.DEPARTMENTNAME LIKE '%COVID%' then 'Tryon Med COVID Clinic - Pineville'
+    when D.DEPARTMENTNAME = 'Tryon Med-Asheville' Then 'Asheville'
+    when D.DEPARTMENTNAME LIKE '%SATELLITE%' then 'Tryon Med Satellite-Uptown 7th' END)
+    AS DEPARTMENTNAME
+,pt.patientid
+,pt.enterpriseid
+,DATEDIFF(year, pt.dob, a.appointmentdate) as age
+,pt.sex
+,LEFT(pt.zip, 5) as zip
+,p.schedulingname
+,concat(p.providerlastname, ', ', p.providerfirstname) as physician_name
+,p.specialty
+,p.providertypecategory
+,p.providertype
+,ap.appointmenttypename
+,ap.appointmenttypeclass
+,a.appointmentstatus
+,A.APPOINTMENTCANCELLEDDATETIME AS APTCANCELLEDDATE
+,DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) AS TIMETOCANCEL
+,a.appointmentcancelreason
+,a.frozenyn
+,a.appointmentfrozenreason
+,(CASE
+    WHEN (DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) = 0
+            AND
+            (A.APPOINTMENTCANCELREASON <> 'PATIENT NO SHOW'
+            OR UPPER(A.APPOINTMENTCANCELREASON) <> 'NO SHOW NO CALL')
+            )
+        THEN 'Same Day Cancellation'
+    WHEN DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) > 0
+        THEN 'Cancelled Before Scheduled Appointment'
+    WHEN (DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) < 0
+            OR
+            UPPER(A.APPOINTMENTCANCELREASON) IN ('PATIENT NO SHOW', 'NO SHOW NO CALL'))
+        THEN 'No Call, No Show'
+    WHEN APPOINTMENTSTATUS = '4 - Charge Entered'
+  THEN 'Attended'
+        ELSE 'Open Slot'
+    END) AS APPOINTMENT_STATUS_CAT
+            
+-- SELECTING other patient level data to add to model
+, pt.LANGUAGE
+, pt.CDCETHNICITYCODE  
+, pt.ETHNICITY
+, pt.CDCRACECODE 
+, pt.RACE
+, pt.ZIP AS PATIENT_ZIP
+, pt.DONOTCALLYN
+, pt.MARITALSTATUS
+, pt.REGISTRATIONDATE
+, pt.PROVIDERGROUPID
+, pt.UNCONFIRMEDFAMILYSIZE
+, pt.UNCONFIRMEDYEARLYINCOME
+, pt.SMSOPTINDATE 
+, d.LONGITUDE AS DEPARTMENT_LONGITUDE
+, d.LATITUDE AS DEPARTMENT_LATITUDE
+            
+from "ATHENAHEALTH"."ATHENAONE"."APPOINTMENT" a
+join "ATHENAHEALTH"."ATHENAONE"."APPOINTMENTTYPE" ap on a.appointmenttypeid = ap.appointmenttypeid
+join "ATHENAHEALTH"."ATHENAONE"."DEPARTMENT" d on a.departmentid = d.departmentid
+join "ATHENAHEALTH"."ATHENAONE"."PROVIDER" p on a.schedulingproviderid = p.providerid
+left join "ATHENAHEALTH"."ATHENAONE"."PATIENT" pt on a.patientid = pT.patientid
+where year(a.appointmentdate) >= year(current_date()) - 3
+and a.appointmentdate < current_date()
+AND (UPPER(DEPARTMENTNAME) LIKE 'TRYON MED%' OR UPPER(DEPARTMENTNAME) LIKE 'TMP%')
+and p.entitytype = 'Person'
+and (pt.patientstatus not in ('d', 'i') or pt.patientstatus is null)
+and upper(p.schedulingname) not like '%TEST%'
+and (pt.testpatientyn = 'N' or pt.testpatientyn is null)
+AND (FROZENYN = 'N' OR FROZENYN IS NULL)
+AND DAYOFWEEK(a.APPOINTMENTDATE) <> 0 AND DAYOFWEEK(a.APPOINTMENTDATE)<>6 -- FILTER OUT WEEKENDS
+AND (TIME(a.APPOINTMENTSTARTTIME) >= '07:00:00' AND TIME(a.APPOINTMENTSTARTTIME) < '17:00:00') --only slots between 7am and 5pm
+            
+),
+df1 as (
+select distinct
+df.*
+,concat(appointmentdate, schedulingname, appointmentstarttime) as SLOT_ID
+,Row_number() over (partition by SLOT_ID order by appointmentcreateddatetime DESC) as SLOT_IDX -- Adding id to each appointment created within a time slot for specific doctor (Descending by date - most recent = 1)
+from df 
+WHERE DEPARTMENTNAME != 'Randolph GI & IM' AND DEPARTMENTNAME != 'Virtual Connect'
+--where schedulingname like '%Alexander%'
+--and appointmentdate = '2021-03-08'
+--and appointmentstarttime = '08:30 AM'
+),
+df2 as (
+SELECT
+  df1.*,
+  LEAD(APPOINTMENTSTATUS,1, APPOINTMENTSTATUS)  -- looking to next row (back in time) to see the status of next most recent appointment
+  OVER (PARTITION BY [APPOINTMENTSTARTTIME],[SCHEDULINGNAME], [APPOINTMENTDATE]  -- Grouping by slot by doctor
+  ORDER BY SLOT_IDX DESC)  AS nextStatusType -- Order by latest to most recent appointments
+  FROM df1
+),
+df3 as (
+SELECT df2.*,
+CASE
+  WHEN APPOINTMENTSTATUS = 'x - Cancelled' AND SLOT_IDX <=2 AND nextStatusType = 'o - Open Slot' THEN 0 -- Case when the next appointment for slot is Open so must not have been filled -> therefore flag cancelled one so we can record that one
+  ELSE SLOT_IDX -- Otherwise keep the same
+END AS importance -- Gets flagged as 0 if most recent is listed as open but should be cancelled (flags cancelled appointment)
+FROM df2
+),
+--find most recent ACTUAL appointment for each slot
+df4 as (
+SELECT
+  APPOINTMENTDATE,
+  APPOINTMENTSTARTTIME,
+  SCHEDULINGNAME,
+  MIN(IMPORTANCE) AS importance_id -- Same as SLOT_IDX unless it was flagged as 0
+  FROM df3
+  GROUP BY APPOINTMENTDATE,APPOINTMENTSTARTTIME, SCHEDULINGNAME
+),
+df5 AS (
+  SELECT df3.*, DAYOFMONTH(df4.APPOINTMENTDATE) AS DAYOFMONTH, DAYNAME(df4.APPOINTMENTDATE) AS DAYOFWEEK, DAYOFYEAR(df4.APPOINTMENTDATE) AS DAYOFYEAR, MONTHNAME(df4.APPOINTMENTDATE) AS MONTH, YEAR(df4.APPOINTMENTDATE) AS YEAR, TIME(df4.APPOINTMENTSTARTTIME) AS APPOINTMENTSTARTTIME_military, HOUR(TIME(df4.APPOINTMENTSTARTTIME)) AS APPOINTMENTSTARTTIME_hour FROM
+df4 LEFT JOIN df3
+ON df3.APPOINTMENTDATE = df4.APPOINTMENTDATE
+    AND df3.APPOINTMENTSTARTTIME = df4.APPOINTMENTSTARTTIME
+    AND df3.SCHEDULINGNAME = df4.SCHEDULINGNAME
+    AND df3.IMPORTANCE = df4.importance_id
+) ,
+-- Getting no show count history per patient
+df6 as (
+SELECT PATIENTID, IFNULL(COUNT(PATIENTID),0) AS NOSHOW_COUNT FROM df5
+WHERE APPOINTMENT_STATUS_CAT = 'No Call, No Show'
+GROUP BY PATIENTID
+)  ,
+df7 as (
+SELECT df5.PATIENTID, 
+  YEAR, DAYOFYEAR, DAYOFMONTH, DAYOFWEEK, MONTH, 
+  APPOINTMENTSTARTTIME_HOUR, SPECIALTY,
+  AGE, SEX, 
+  CASE WHEN LANGUAGE = 'English' THEN 'ENGLISH' ELSE 'Other' END AS LANGUAGE
+  
+  , CASE 
+        WHEN CDCRACECODE = '1002-5' THEN 'American Indian or Alaska Native'
+        WHEN CDCRACECODE = '2028-9' THEN 'Asian'
+        WHEN CDCRACECODE = '2054-5' THEN 'Black or African American'
+        WHEN CDCRACECODE = '2076-8' THEN 'Native Hawaiian or Other Pacific Islander'
+        -- WHEN CDCRACECODE = '2131-1' THEN 'Other Race'
+        WHEN CDCRACECODE = '2106-3' THEN 'White'
+        WHEN RACE = 'Patient Declined' AND CDCRACECODE IS NULL THEN 'Patient Declined'
+        ELSE 'Other'
+    END AS RACE
+  , CASE 
+        WHEN ETHNICITY = 'Not Hispanic or Latino' THEN 'Non-Hispanic or Latin American'
+        WHEN ETHNICITY = 'Patient Declined' THEN 'Patient Declined'
+        ELSE 'Hispanic or Latin American'
+    END AS ETHNICITY
+  --, CASE 
+   -- WHEN RACE = 'Asian' THEN 'Asian' 
+   -- WHEN RACE = 'White' OR RACE = 'European' THEN 'Caucasian' 
+   -- WHEN RACE = 'African American' OR RACE = 'Black' OR 'Black or African American' THEN 'African American' 
+   -- WHEN RACE = 'Hispanic' THEN
+   -- WHEN RACE = 'Patient Declined' THEN 'Patient Declined'
+  
+
+  ,PATIENT_ZIP
+  ,DEPARTMENT_LONGITUDE
+  ,DEPARTMENT_LATITUDE
+--  ,DONOTCALLYN --Only 66 rows with 'Y' so don't think its good indicator
+  ,CASE 
+    WHEN MARITALSTATUS = 'DIVORCED' OR MARITALSTATUS = 'SEPARATED' OR MARITALSTATUS = 'SINGLE' OR MARITALSTATUS = 'WIDOWED' THEN 'Single'
+    WHEN MARITALSTATUS = 'MARRIED' OR MARITALSTATUS = 'PARTNER' THEN 'PARTNER'
+    ELSE 'OTHER'
+  END AS MARITALSTATUS
+    
+--  ,REGISTRATIONDATE  -- POSSIBLY ADD LATER
+--  ,PROVIDERGROUPID
+--  ,UNCONFIRMEDFAMILYSIZE
+--  ,UNCONFIRMEDYEARLYINCOME
+  ,CASE WHEN SMSOPTINDATE IS NOT NULL THEN 'Y' ELSE 'N' END AS SMSOPTIN
+  ,NOSHOW_COUNT,  
+  APPOINTMENTCREATEDDATETIME, APPOINTMENTDATE, APPOINTMENTSTATUS, APPOINTMENT_STATUS_CAT, 
+  DATEDIFF(day, APPOINTMENTCREATEDDATETIME, APPOINTMENTDATE) AS DATE_DIFF FROM
+df5 LEFT JOIN df6
+ON df5.PATIENTID = df6.PATIENTID
+) 
+SELECT *, 
+    CASE 
+        WHEN DATE_DIFF <= 3 THEN '0-3'
+        WHEN DATE_DIFF <= 130 AND DATE_DIFF > 3 THEN '4-130'
+        WHEN DATE_DIFF <= 649 AND DATE_DIFF > 130 THEN '131-649'
+        WHEN DATE_DIFF > 649 THEN '>649'
+     END AS DATE_DIFF_CATEGORY,
+     CASE 
+        WHEN AGE <= 26 THEN '<=26'
+        WHEN AGE <= 34 AND AGE > 26 THEN '27-34'
+        WHEN AGE <= 39 AND AGE > 34 THEN '35-39'
+        WHEN AGE <= 53 AND AGE > 39 THEN '40-53'
+        WHEN AGE <= 64 AND AGE > 53 THEN '54-64'
+        WHEN AGE <= 82 AND AGE > 64 THEN '65-82'
+        WHEN  AGE > 82 THEN '>82'
+      END AS AGE_CATEGORY,
+     CASE  --ADDING A KNOT in age continuous variable
+        WHEN AGE >= 75 THEN AGE - 75
+        ELSE 0
+     END AS AGE_AFTER75,
+     CASE 
+        WHEN AGE < 75 THEN AGE 
+        ELSE 75
+     END AS AGE_BEFORE75
+      
+FROM df7
+
+
+```
+
+
+# LOAD IN FOR NOW
+```{r}
+
+ #data <- load('C:/Users/AlexanderDonald/OneDrive - Tryon Direct/Desktop/Project1/Data Exploration/model_data_updated.RData')
+#table(data$ETHNICITY)
+data <- slots %>%
+  filter(APPOINTMENTSTATUS == "4 - Charge Entered" | 
+           APPOINTMENTSTATUS == "x - Cancelled")
+# DONT WANT NA BECAUSE THEY INTRODUCE NAS
+#unique(data$APPOINTMENTSTATUS)
+data$NOSHOW_COUNT[is.na(data$NOSHOW_COUNT)] <- 0
+#save(data, file='model_data2.RData')
+
+```
+
+## Initial data frame
+```{r}
+#data <- load('C:/Users/AlexanderDonald/OneDrive - Tryon Direct/Desktop/Project1/model_data2.RData') #SOMETHING FUNKY WITH THIS
+
+df <- data %>%
+  dplyr::filter(SPECIALTY == "Internal Medicine") %>% #EDIT
+  mutate(slot_noShow = case_when(
+        APPOINTMENTSTATUS == 'x - Cancelled'  & 
+        APPOINTMENT_STATUS_CAT == 'No Call, No Show' ~ 1, 
+        TRUE ~ 0)) %>%
+  mutate(previous_noshow = case_when( #EDIT
+        NOSHOW_COUNT == 0 ~ '0',
+        NOSHOW_COUNT == 1 ~ '1',
+        NOSHOW_COUNT == 2 ~ '2',
+        TRUE ~ '>2')) %>%
+  mutate(time_category = case_when( #EDIT
+        APPOINTMENTSTARTTIME_HOUR <= 9 & APPOINTMENTSTARTTIME_HOUR >=14 ~ 'Ends of Day',
+        TRUE ~ 'Middle of day')) %>%
+#Going off this previous study
+  dplyr::select(APPOINTMENTDATE, DAYOFWEEK, MONTH, time_category, SPECIALTY, AGE_CATEGORY,  SEX, LANGUAGE, ETHNICITY, RACE,  MARITALSTATUS, SMSOPTIN,  previous_noshow, DATE_DIFF_CATEGORY, slot_noShow)
+head(df, 5)
+
+```
+
+
+
+#Testing binning
+```{r}
+
+#https://blog.revolutionanalytics.com/2015/03/r-package-smbinning-optimal-binning-for-scoring-modeling.html
+binning <- data %>%
+  dplyr::filter(SPECIALTY == "Internal Medicine" & YEAR == 2021) %>% #EDIT
+  mutate(slot_noShow = case_when(
+        APPOINTMENTSTATUS == 'x - Cancelled'  & 
+        APPOINTMENT_STATUS_CAT == 'No Call, No Show' ~ 1, 
+        TRUE ~ 0)) %>%
+  dplyr::select(AGE, NOSHOW_COUNT, DATE_DIFF, slot_noShow, MARITALSTATUS, APPOINTMENTSTARTTIME_HOUR ) 
+
+unique(binning$APPOINTMENTSTARTTIME_HOUR)
+df7 <- na.omit(binning)
+# Load package and its data 
+library(smbinning) 
+
+#print(df7)
+# Run and save results 
+result=smbinning(df=df7,y="slot_noShow",x="NOSHOW_COUNT",p=0.05) 
+print(result$ivtable)
+ 
+# About IV - https://www.projectpro.io/recipes/what-is-information-value-modelling 
+
+
+```
+
+
+# Load libraries
+```{python}
+#importing and training the model
+from matplotlib import pyplot as plt
+import pandas as pd
+import numpy as np
+from sklearn import preprocessing
+from sklearn.metrics import f1_score, accuracy_score, confusion_matrix
+from sklearn.metrics import precision_recall_curve, roc_auc_score, precision_score, recall_score
+from sklearn.metrics import auc
+from matplotlib import pyplot
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import make_column_transformer
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import Normalizer
+from sklearn.pipeline import Pipeline
+from datetime import date
+from dateutil.relativedelta import relativedelta
+from sklearn.metrics import roc_curve
+import pickle
+from numpy import mean
+from sklearn.datasets import make_classification
+from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import RepeatedStratifiedKFold
+from sklearn.tree import DecisionTreeClassifier
+import imblearn
+from imblearn.pipeline import Pipeline
+from imblearn.over_sampling import SMOTE
+from imblearn.under_sampling import RandomUnderSampler
+from collections import Counter
+
+```
+
+
+#Training
+## Using Python's sklearn package to balance weight of each class for Logistic Regression
+### Adding class_weight='balanced' balances the weighting of each class and is important in our case
+```{python}
+
+# Getting df 
+df = r.df
+# Drop rows with NAs
+df = df.dropna()
+
+# Break up to training and test
+#train = df[df['YEAR'] == 2021]
+#test = df[df['YEAR'] ==  2022]
+train = df[(df['APPOINTMENTDATE'] >= date.today() + relativedelta(months=-18)) & (df['APPOINTMENTDATE'] <  date.today() + relativedelta(months=-6))]
+test = df[df['APPOINTMENTDATE'] >=  date.today() + relativedelta(months=-6)]
+
+
+# Remove date col
+train = train.drop(columns=['APPOINTMENTDATE'])
+test = test.drop(columns=['APPOINTMENTDATE'])
+
+x_train = train.loc[:, train.columns != "slot_noShow"]
+x_test = test.loc[:, test.columns != "slot_noShow"]
+
+y_train = train["slot_noShow"]
+y_test = test["slot_noShow"]
+
+
+#Scikit learn one hot encoder
+#https://towardsdatascience.com/guide-to-encoding-categorical-features-using-scikit-learn-for-machine-learning-5048997a5c79
+# https://www.dataschool.io/encoding-categorical-features-in-python/ -- Make pipelines
+ohe = OneHotEncoder(sparse=False)
+column_transform = make_column_transformer((ohe, ['MONTH', 'SPECIALTY', 'SEX', 'DAYOFWEEK',  'DATE_DIFF_CATEGORY', 'AGE_CATEGORY', 'LANGUAGE', 'ETHNICITY', 'RACE',  'MARITALSTATUS', 'SMSOPTIN', 'previous_noshow', 'time_category']), remainder='passthrough') # passes over the numeric column
+
+encoder = column_transform.fit(x_train) #HOW TO DEAL WITH CATEGORIES SUCH AS MONTH THAT ARE IN TRAIN BUT NOT TEST - fit it to train and then transform test based off this fit
+
+x_train = encoder.transform(x_train)
+x_test = encoder.transform(x_test)
+
+
+
+lr = LogisticRegression(solver='saga', class_weight='balanced', tol=0.01, max_iter=100, penalty='l1', verbose = 2) #solver='newton-cg',
+
+lr.fit(x_train, y_train)
+print(lr.coef_)
+
+
+# Predicting on the test data
+pred_test = lr.predict(x_test)
+pred = lr.predict_proba(x_test)[:,1] # Probability of 1
+
+
+# Test using threshold of .4
+bestThresh = .2
+thresh = bestThresh
+preds = []
+for prob in pred: # Use numpy vector condition instead for faster running
+    #print(prob)
+    if prob >= thresh:
+        preds.append(1)
+    else:
+      preds.append(0)
+#Ploting the confusion matrix
+matrix = confusion_matrix(y_test, preds)
+matrix
+
+print(f'Area Under Curve: {roc_auc_score(y_test, preds)}')
+
+
+#calculate precision and recall
+precision, recall, thresholds = precision_recall_curve(y_test, pred)
+# Uses thresholds to get data points to plot on the curve
+
+# calculate the no skill line as the proportion of the positive class
+no_skill = len(y_test[y_test==1]) / len(y_test)
+# plot the no skill precision-recall curve
+pyplot.plot([0, 1], [no_skill, no_skill], linestyle='--', label='No Skill')
+
+# plot the model precision-recall curve
+pyplot.plot(recall, precision, marker='.', label='Logistic')
+# axis labels
+pyplot.xlabel('Recall')
+pyplot.ylabel('Precision')
+# show the legend
+pyplot.legend()
+
+
+#display plot
+pyplot.show()
+
+# Compare models using auc
+# calculate the precision-recall auc
+auc_score_model = auc(recall, precision)
+print('Logistic PR AUC: %.3f' % auc_score_model) 
+
+# DUMMY MODEL FOR BASELINE
+from sklearn.dummy import DummyClassifier
+# no skill model, stratified random class predictions
+model = DummyClassifier(strategy='stratified')
+model.fit(x_train, y_train)
+yhat = model.predict_proba(x_test)
+y_hat_preds = model.predict(x_test)
+pos_probs = yhat[:, 1]
+# calculate the precision-recall auc
+precision, recall, _ = precision_recall_curve(y_test, pos_probs)
+auc_score_dummy = auc(recall, precision)
+print('No Skill PR AUC: %.3f' % auc_score_dummy)
+
+#######################
+
+
+## F1 ###############################################
+f1_test = f1_score(y_test, pred_test)
+print('The f1 score for the testing data:', f1_test)
+
+# Plot threshold vs F1 score
+thresholds = []
+f1Scores = []
+for thresh in np.arange (0.0, 1, .05):
+  thresholds.append(thresh)
+  # Need to loop through pred probs and determine class based on thresh
+  preds = []
+  for prob in pred: # Use numpy vector condition instead for faster running
+      #print(prob)
+      if prob >= thresh:
+          preds.append(1)
+      else:
+        preds.append(0)
+  
+  # Calc F1 score
+  f1Scores.append(f1_score(y_test, preds))
+#print(f1Scores)
+plt.plot(thresholds, f1Scores)
+plt.show() # seems like a threshold of .4 gives the best f1 score for current model of around .3
+
+bestIndex = np.argmax(f1Scores)
+bestThresh = thresholds[bestIndex]
+print("Best Thresh: " + str(bestThresh))
+bestThresh = .2
+thresh = bestThresh
+preds = []
+for prob in pred:
+    #print(prob)
+    if prob >= thresh:
+        preds.append(1)
+    else:
+      preds.append(0)
+f1 = f1_score(y_test, preds)
+print(f"The f1_score for the optimal threshold ({bestThresh}): ", f1)      
+#Ploting the confusion matrix
+matrix = confusion_matrix(y_test, preds)
+matrix
+
+print(f'Area Under Curve: {roc_auc_score(y_test, preds)}')
+
+#ROC Curve
+
+fpr, tpr, thresholds = roc_curve(y_test, pred)
+# plot the roc curve for the model
+pyplot.plot([0,1], [0,1], linestyle='--', label='No Skill')
+pyplot.plot(fpr, tpr, marker='.', label='Logistic')
+# axis labels
+pyplot.xlabel('False Positive Rate')
+pyplot.ylabel('True Positive Rate')
+pyplot.legend()
+# show the plot
+pyplot.show()
+
+
+# Probability, prediction and actual
+dict = {"predictions": preds, "probability": pred, "actual": y_test}
+breakdown = pd.DataFrame(dict)
+breakdown
+
+#Performance metrics based on the best threshold for the f1 score
+print(f'Accuracy Score: {accuracy_score(y_test,preds)}') # Number right
+print(f'Confusion Matrix: \n{confusion_matrix(y_test, preds)}')
+print(f'Area Under Curve: {roc_auc_score(y_test, preds)}') # How good it is at distinguishing between 0s and 1s
+print(f'Recall score: {recall_score(y_test,preds)}') # tp/ tp + fn --bottom of conf matrix
+print(f'Precision score: {precision_score(y_test,preds)}') # true positives/ (tp + fp)  -- right side of conf matrix THE KEYY
+print(f'F1 score (Random Model - Baseline): {f1_score(y_test, y_hat_preds)}')
+#KEYYYY METRIC - combines precision and recall
+print(f'F1 score (thresh: {bestThresh}): {f1_score(y_test, preds)}')
+
+
+
+
+# Get optimal thresh based off training data - don't want to taint test data
+def find_opt_thresh(pred):
+    # Plot threshold vs F1 score
+    thresholds = []
+    ROCScores = []
+    for thresh in np.arange (0.0, 1, .05):
+      print(thresh)
+      thresholds.append(thresh)
+      # Need to loop through pred probs and determine class based on thresh
+      preds = []
+      for prob in pred: # Use numpy vector condition instead for faster running
+          #print(prob)
+          if prob >= thresh:
+              preds.append(1)
+          else:
+            preds.append(0)
+      # Calc F1 score
+      ROCScores.append(roc_auc_score(y_train, preds))
+    
+    plt.plot(thresholds, ROCScores)
+    plt.show() # seems like a threshold of .4 gives the best f1 score for current model of around .3
+  
+    bestIndex = np.argmax(ROCScores)
+    bestThresh = thresholds[bestIndex]
+    print("Best Thresh: " + str(bestThresh))
+    
+    return thresholds, ROCScores
+#predicting on train
+train_preds = lr.predict_proba(x_train)[:,1]
+thresholds, ROCScores = find_opt_thresh(train_preds)
+
+
+#import pickle
+#pickle.dump(lr, open("new1_10000epochs", 'wb'))
+# load the model from disk
+#import pickle
+#loaded_model = pickle.load(open("model4", 'rb'))
+#print(x_train)
+#loaded_model.coef_
+#loaded_model.predict_proba(x_test)
+# Precision low because we have a lot of false positives. Slots identified as no shows that aren't
+
+
+```
+
+# Final Linear regression (with class_weight param and thresh=.2)
+```{python}
+
+# Getting df 
+df = r.df
+# Drop rows with NAs
+df = df.dropna()
+
+# Break up to training and test
+train = df[(df['APPOINTMENTDATE'] >= date.today() + relativedelta(months=-18)) & (df['APPOINTMENTDATE'] <  date.today() + relativedelta(months=-6))]
+test = df[df['APPOINTMENTDATE'] >=  date.today() + relativedelta(months=-6)]
+
+
+# Remove date col
+train = train.drop(columns=['APPOINTMENTDATE'])
+test = test.drop(columns=['APPOINTMENTDATE'])
+
+x_train = train.loc[:, train.columns != "slot_noShow"]
+x_test = test.loc[:, test.columns != "slot_noShow"]
+
+y_train = train["slot_noShow"]
+y_test = test["slot_noShow"]
+
+ohe = OneHotEncoder(sparse=False)
+
+column_transform = make_column_transformer((ohe, ['MONTH', 'SPECIALTY', 'SEX', 'DAYOFWEEK',  'DATE_DIFF_CATEGORY', 'AGE_CATEGORY', 'LANGUAGE', 'ETHNICITY', 'RACE',  'MARITALSTATUS', 'SMSOPTIN', 'previous_noshow', 'time_category']), remainder='passthrough') # passes over the numeric column
+
+
+
+encoder = column_transform.fit(x_train) #HOW TO DEAL WITH CATEGORIES SUCH AS MONTH THAT ARE IN TRAIN BUT NOT TEST - fit it to train and then transform test based off this fit
+
+x_train = encoder.transform(x_train)
+x_test = encoder.transform(x_test)
+
+
+mod1 = pickle.load(open("final_5000epochs", 'rb'))
+bestThresh = .2  #Found during training
+pred = mod1.predict_proba(x_test)[:,1] # Probability of 1
+preds = []
+for prob in pred: # Use numpy vector condition instead for faster running
+    #print(prob)
+    if prob >= bestThresh:
+        preds.append(1)
+    else:
+      preds.append(0)
+      
+#Performance metrics based on the best threshold for the f1 score
+print(f'Accuracy Score: {accuracy_score(y_test,preds)}') # Number right
+print(f'Confusion Matrix: \n{confusion_matrix(y_test, preds)}')
+print(f'Area Under Curve: {roc_auc_score(y_test, preds)}') # How good it is at distinguishing between 0s and 1s
+print(f'Recall score: {recall_score(y_test,preds)}') # tp/ tp + fn --bottom of conf matrix
+print(f'Precision score: {precision_score(y_test,preds)}') # true positives/ (tp + fp)  -- right side of conf matrix THE KEYY
+print(f'F1 score (thresh: {bestThresh}): {f1_score(y_test, preds)}')
+
+
+# Get model coeficients
+def get_coefs():
+    names = column_transform.get_feature_names_out()
+    for i in range(0,len(names)):
+        names[i] = names[i].replace('onehotencoder__', '') 
+    
+    coeficients = mod1.coef_[0]
+    
+    dict = {'Feature': names, 'Coef': coeficients}
+    coefs = pd.DataFrame(dict)
+    
+    for i in range(len(names)):
+        print(names[i] + ':  ' + str(coeficients[i]))
+        
+get_coefs   
+```
+
+
+
+# Final linear regression (using SMOTE sampling to make classes equal weight and thresh = .3)
+```{python}
+############################################################## SMOTE 
+# Getting df 
+df = r.df
+# Drop rows with NAs
+df = df.dropna()
+
+# Break up to training and test
+train = df[(df['APPOINTMENTDATE'] >= date.today() + relativedelta(months=-18)) & (df['APPOINTMENTDATE'] <  date.today() + relativedelta(months=-6))]
+test = df[df['APPOINTMENTDATE'] >=  date.today() + relativedelta(months=-6)]
+
+
+# Remove date col
+train = train.drop(columns=['APPOINTMENTDATE'])
+test = test.drop(columns=['APPOINTMENTDATE'])
+
+x_train = train.loc[:, train.columns != "slot_noShow"]
+x_test = test.loc[:, test.columns != "slot_noShow"]
+
+y_train = train["slot_noShow"]
+y_test = test["slot_noShow"]
+
+ohe = OneHotEncoder(sparse=False)
+
+column_transform = make_column_transformer((ohe, ['MONTH', 'SPECIALTY', 'SEX', 'DAYOFWEEK',  'DATE_DIFF_CATEGORY', 'AGE_CATEGORY', 'LANGUAGE', 'ETHNICITY', 'RACE',  'MARITALSTATUS', 'SMSOPTIN', 'previous_noshow', 'time_category']), remainder='passthrough') # passes over the numeric column
+
+
+encoder = column_transform.fit(x_train) #HOW TO DEAL WITH CATEGORIES SUCH AS MONTH THAT ARE IN TRAIN BUT NOT TEST - fit it to train and then transform test based off this fit
+
+
+x_train = encoder.transform(x_train)
+x_test = encoder.transform(x_test)
+
+print(x_train)
+
+#TRAINING
+'''
+from imblearn.pipeline import Pipeline
+
+over = SMOTE(sampling_strategy=0.3)
+under = RandomUnderSampler(sampling_strategy=0.9)
+steps = [('o', over), ('u', under)]
+pipeline = Pipeline(steps=steps)
+
+# transform the dataset
+X, y = pipeline.fit_resample(x_train, y_train)
+counter = Counter(y)
+print(counter)
+lr = LogisticRegression(solver='saga',  tol=0.000001, max_iter=1000000, penalty='l1', verbose = 2) #solver='newton-cg',
+# aDD l1 penalty???? # What solver???
+
+lr.fit(X, y)
+print(lr.coef_)
+'''
+mod2 = pickle.load(open("SMOTE_sampling_model", 'rb'))
+
+# Predicting on the test data
+pred_test = mod2.predict(x_test)
+#print(pred_test)
+#pred = lr.predict_proba(x_test) # Gets probability
+#print(pred)
+#Calculating and printing the f1 score
+
+## Precision-Recall ################################
+pred = mod2.predict_proba(x_test)[:,1] # Probability of 1
+
+# Get optimal thresh when training -- currently .3 for mod2
+'''
+# Plot threshold 
+thresholds = []
+ROCScores = []
+for thresh in np.arange (0.0, 1, .05):
+  thresholds.append(thresh)
+  # Need to loop through pred probs and determine class based on thresh
+  preds = []
+  for prob in pred: # Use numpy vector condition instead for faster running
+      #print(prob)
+      if prob >= thresh:
+          preds.append(1)
+      else:
+        preds.append(0)
+  # Calc F1 score
+  ROCScores.append(roc_auc_score(y_test, preds))
+
+plt.plot(thresholds, ROCScores)
+plt.show() # seems like a threshold of .4 gives the best f1 score for current model of around .3
+
+bestIndex = np.argmax(ROCScores)
+bestThresh = thresholds[bestIndex]
+print("Best Thresh: " + str(bestThresh))
+'''
+
+#thresh = bestThresh
+thresh = .3
+preds = []
+for prob in pred: # Use numpy vector condition instead for faster running
+    #print(prob)
+    if prob >= thresh:
+        preds.append(1)
+    else:
+      preds.append(0)
+#Ploting the confusion matrix
+matrix = confusion_matrix(y_test, preds)
+matrix
+
+  
+#Performance metrics based on the best threshold for the f1 score
+print(f'Accuracy Score: {accuracy_score(y_test,preds)}') # Number right
+print(f'Confusion Matrix: \n{confusion_matrix(y_test, preds)}')
+print(f'Area Under Curve: {roc_auc_score(y_test, preds)}') # How good it is at distinguishing between 0s and 1s
+print(f'Recall score: {recall_score(y_test,preds)}') # tp/ tp + fn --bottom of conf matrix
+print(f'Precision score: {precision_score(y_test,preds)}') # true positives/ (tp + fp)  -- right side of conf matrix THE KEYY
+print(f'F1 score (thresh: .3): {f1_score(y_test, preds)}')
+
+#import pickle
+#pickle.dump(lr, open("SMOTE_sampling_model", 'wb'))
+
+
+# Get model coeficients
+def get_coefs():
+    names = column_transform.get_feature_names_out()
+    for i in range(0,len(names)):
+        names[i] = names[i].replace('onehotencoder__', '') 
+    
+    coeficients = mod2.coef_[0]
+    
+    dict = {'Feature': names, 'Coef': coeficients}
+    coefs = pd.DataFrame(dict)
+    
+    for i in range(len(names)):
+        print(names[i] + ':  ' + str(coeficients[i]))
+
+
+
+```
+
+# Save train data
+```{r}
+#py$test
+#a <- py$train
+#save(a, file="C:/Users/AlexanderDonald/OneDrive - Tryon Direct/Desktop/Project1/model_data_updated.RData")
+
+```
+
+
+## See what prediction accuracy looks like when grouping by day
+```{r}
+
+test <- df %>%
+  filter(APPOINTMENTDATE >= today() %m-% months(6))
+test$prediction <- py$preds
+
+test %>%
+  filter(APPOINTMENTDATE >= today() %m-% months(6) & APPOINTMENTDATE <= today() -14) %>%
+  mutate(correct = case_when(
+    slot_noShow == prediction ~ 1,
+    TRUE ~ 0 
+  )) %>%
+  group_by(APPOINTMENTDATE) %>%
+  summarise(correct_perc = sum(correct)/n()) %>%
+  ggplot(aes(x=APPOINTMENTDATE, y=correct_perc)) + geom_point() + geom_smooth() +
+  labs(x = "Date",
+    y = "Percent Predicted Correct",
+    title = "Percent correct predictions over time",
+    subtitle = "Predictions for whether a slot will be a no-show or not") 
+
+actual <- test%>%
+  filter(APPOINTMENTDATE >= today() %m-% months(6) & APPOINTMENTDATE <= today() -14) %>%
+  filter(slot_noShow == 1) %>%
+  group_by(APPOINTMENTDATE) %>%
+  summarise(total_noshows = n())
+
+predicted <- test%>%
+  filter(APPOINTMENTDATE >= today() %m-% months(6) & APPOINTMENTDATE <= today() -14) %>%
+  filter(prediction == 1) %>%
+  group_by(APPOINTMENTDATE) %>%
+  summarise(number_predicted = sum(prediction)) 
+  
+a <- left_join(actual, predicted) 
+library(ggalt)
+a %>%
+  ggplot(aes(x=APPOINTMENTDATE)) + 
+           geom_line(aes(y=total_noshows)) + geom_line(aes(y=number_predicted, colour='red'))
+
+# Group by week 
+a$week_num <- strftime(a$APPOINTMENTDATE, format= "%V")
+a %>%
+  group_by(week_num)%>%
+  summarise(perc = sum(number_predicted)/sum(total_noshows)) %>%
+  ggplot(aes(x=week_num, y=perc)) + geom_point() + ylim(0,6) + 
+  labs(x = "Date",
+    y = "Ratio of predicted to total no-shows",
+    title = "Analyzing total predicted vs actual no-shows over time")
+
+# Average ratio of predicted to actual
+a %>%
+  filter(APPOINTMENTDATE < '2022-05-15' & APPOINTMENTDATE >= as.Date('2022-05-15') %m-% months(4)) %>%
+  summarise(mean = mean(number_predicted/total_noshows))
+
+meanNum <- 4.87
+
+a %>%
+  filter(APPOINTMENTDATE >= '2022-05-15') %>%
+  mutate(suggested = number_predicted/meanNum) %>%
+  ggplot(aes(x=APPOINTMENTDATE)) + 
+           geom_line(aes(y=total_noshows, colour='blue')) + geom_line(aes(y=suggested, colour='red')) + 
+  scale_color_manual(labels = c("actual", "predicted"), values = c("blue", "red")) + 
+  labs(x = "Date",
+    y = "No-Show count (actual and predicted)",
+    title = "Trends of actual vs. predicted no-shows over time",
+    subtitle = "With predicted scaled down using mean ratio of predicted : total no-shows") 
+
+a %>%
+  filter(APPOINTMENTDATE >= '2022-05-15') %>%
+  mutate(suggested = number_predicted/meanNum) %>%
+  summarise(avg_error = mean(abs(suggested - total_noshows)))
+
+
+a %>%
+  filter(APPOINTMENTDATE >= '2022-05-15') %>%
+  mutate(suggested = number_predicted/meanNum) %>%
+  mutate(percentage = 100*(suggested/total_noshows)) %>%
+  summarise(avg_error = mean(abs(percentage - total_noshows)))
+  ggplot(aes(x=APPOINTMENTDATE, y = percentage)) + geom_line() + geom_hline(yintercept=100, linetype="dashed", color = "red") + ylim(0,175) +
+  labs(x = "Date",
+    y = "Percent",
+    title = "Percent of total no-shows predicted",
+    subtitle = "With predicted scaled down using mean ratio of predicted : total no-shows")
+```
+
+
+# Seeing correlation between features and adjusting binning to train data
+
+# Day of Week vs No Show
+```{r, include=FALSE}
+df %>%
+  group_by(DAYOFWEEK) %>%
+  summarise(noShow_perc = sum(slot_noShow)/n())%>%
+  ggplot(aes(x=noShow_perc, y=fct_reorder(DAYOFWEEK, noShow_perc))) + geom_bar(stat = "identity")
+
+```
+
+
+
+# Month vs No Show
+```{r, include=FALSE}
+
+month.abb <- c("Jan","Feb", "Mar", "Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec")
+
+df$Monthf <- factor(x=df$MONTH, levels=month.abb)
+
+df %>%
+  group_by(Monthf) %>%
+  summarise(noShow_perc = sum(slot_noShow)/n())%>%
+  ggplot(aes(x=Monthf, y=noShow_perc)) + geom_bar(stat = "identity")
+
+```
+
+Not sure optimal way to group these since they are pretty similar
+
+
+# Appointment start time hour vs No Show
+```{r, include=FALSE}
+
+df %>%
+  group_by(APPOINTMENTSTARTTIME_HOUR) %>%
+  summarise(noShow_perc = sum(slot_noShow)/n())%>%
+  ggplot(aes(x=APPOINTMENTSTARTTIME_HOUR, y=noShow_perc)) + geom_point() + geom_smooth()
+
+```
+
+
+Leave this a continuous??? Seems like model wouldn't do well with it since it is not linear
+
+
+# Specialty vs No Show
+```{r, include=FALSE}
+
+df %>%
+  group_by(SPECIALTY) %>%
+  summarise(noShow_perc = sum(slot_noShow)/n())%>%
+  ggplot(aes(x=noShow_perc, y=fct_reorder(SPECIALTY, noShow_perc))) + geom_bar(stat = "identity")
+
+```
+
+Think these can probably stay in these categories for now
+
+
+
+
+# Age vs No Show
+```{r, include=FALSE}
+#MUST RERUN TOP CHUNK FOR NOW
+# USING df since it has continuous age
+#df$bins <- cut(df$AGE, breaks=c(0,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100,105))
+df %>%
+  filter(YEAR == 2021) %>%
+  group_by(AGE_CATEGORY) %>%
+  summarise(noShow_perc = sum(slot_noShow)/n()) %>%
+  ggplot(aes(x=noShow_perc, y=AGE_CATEGORY)) + geom_bar(stat="identity")
+
+```
+
+Decide on more accurate binning
+
+
+
+# Sex vs No Show
+```{r, include=FALSE}
+df %>%
+  group_by(SEX) %>%
+  summarise(noShow_perc = sum(slot_noShow)/n()) %>%
+  ggplot(aes(x=SEX, y=noShow_perc)) + geom_bar(stat="identity")
+
+```
+Male and female have no significant difference but NA does
+
+
+
+# Language vs No Show
+```{r, include=FALSE}
+
+df %>%
+  group_by(LANGUAGE) %>%
+  summarise(noShow_perc = sum(slot_noShow)/n()) %>%
+  ggplot(aes(x=LANGUAGE, y=noShow_perc)) + geom_bar(stat="identity")
+
+```
+
+
+Definitely significant
+
+
+
+# Ethnicity vs No Show
+```{r, include=FALSE}
+
+df %>%
+  group_by(ETHNICITY) %>%
+  summarise(noShow_perc = sum(slot_noShow)/n()) %>%
+  ggplot(aes(x=ETHNICITY, y=noShow_perc)) + geom_bar(stat="identity")
+
+```
+
+
+Group patient declined and non hispanic into other category???
+
+
+# Race vs No Show
+```{r, include=FALSE}
+
+df %>%
+  group_by(RACE) %>%
+  summarise(noShow_perc = sum(slot_noShow)/n()) %>%
+  ggplot(aes(x=noShow_perc, y=fct_reorder(RACE,noShow_perc))) + geom_bar(stat="identity")
+
+```
+
+Other, other race, and patient declined should probably be consolidated. We are going off CDC codes so not sure if those are great
+
+
+# Marital Status vs No Show
+```{r, include=FALSE}
+
+df %>%
+  filter(MARITALSTATUS != "NA") %>%
+  group_by(MARITALSTATUS) %>%
+  summarise(noShow_perc = sum(slot_noShow)/n()) %>%
+  ggplot(aes(x=MARITALSTATUS, y=noShow_perc)) + geom_bar(stat="identity")
+
+table(df$MARITALSTATUS)
+```
+
+
+
+# SMSOptin vs No Show
+```{r, include=FALSE}
+
+data %>%
+  group_by(SMSOPTIN) %>%
+  summarise(noShow_perc = sum(slot_noShow)/n()) %>%
+  ggplot(aes(x=SMSOPTIN, y=noShow_perc)) + geom_bar(stat="identity")
+
+```
+Makes sense that people have not opted in have a slightly higher no show percentage
+
+
+# Previous no show count vs No Show
+```{r, include=FALSE}
+# filter with prior appointment with atleast one completed appointment
+df %>%
+  group_by(previous_noshow) %>%
+  summarise(noShow_perc = sum(slot_noShow)/n()) %>%
+  ggplot(aes(x=previous_noshow, y=noShow_perc)) + geom_bar(stat="identity")
+
+```
+Higher no show count does seem to be positively correlated with noshow_perc. Could keep are continuous numerical
+
+
+# datediff vs No Show
+```{r, include=FALSE}
+
+df %>%
+  filter(DATE_DIFF >= 0 & DATE_DIFF < 365) %>%
+  group_by(DATE_DIFF) %>%
+  summarise(noShow_perc = sum(slot_noShow)/n()) %>%
+  ggplot(aes(x=DATE_DIFF, y=noShow_perc)) + geom_point()+ geom_smooth()
+
+```
+
+
+# datediff CATEGORY  vs No Show
+```{r, include=FALSE}
+
+df %>%
+  group_by(DATE_DIFF_CATEGORY) %>%
+  summarise(noShow_perc = sum(slot_noShow)/n()) %>%
+  ggplot(aes(x=DATE_DIFF_CATEGORY, y=noShow_perc)) + geom_bar(stat = "identity")
+
+```
+
+
+Think this could remain a continuous numerical variable as it seems to trend linearly up as date diff increases
+
+# Distance from appointment location vs No Show
+```{r, include=FALSE}
+
+df$bins <- cut(df$DISTANCE_miles, breaks=c(0,1,5,20,50,100))
+print(df$bins)
+df %>%
+  filter(YEAR == 2021 & DISTANCE_miles <= 100) %>%
+  group_by(bins) %>%
+  summarise(noShow_perc = sum(slot_noShow)/n()) %>%
+  ggplot(aes(x=noShow_perc, y=bins)) + geom_bar(stat="identity")
+```
+
+
+```{r}
+# Testing the model and making cool figure
+
+#Getting data for the month of June 2022
+data <- get_noshow_data(snow_snow, '2022-06-01', '2022-06-30')
+
+# Make prediction on whether they were no shows or not
+predictions <- predict_noshow(data)
+
+confusionMatrix(predictions$Prediction, slot_noshow)
+
+
+```
+
+

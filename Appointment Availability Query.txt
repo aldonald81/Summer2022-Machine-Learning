@@ -1,0 +1,207 @@
+with df as (SELECT
+a.parentappointmentid
+,a.appointmentid
+,a.appointmentdate
+,a.appointmentstarttime
+,a.appointmentcreateddatetime
+,a.appointmentscheduleddatetime
+,(CASE WHEN D.DEPARTMENTNAME LIKE 'Tryon Med %' Then (REPLACE(D.DEPARTMENTNAME, 'Tryon Med - ', ''))
+    when D.DEPARTMENTNAME LIKE '%COVID%' then 'Tryon Med COVID Clinic - Pineville'
+    when D.DEPARTMENTNAME = 'Tryon Med-Asheville' Then 'Asheville'
+    when D.DEPARTMENTNAME LIKE '%SATELLITE%' then 'Tryon Med Satellite-Uptown 7th' END)
+    AS DEPARTMENTNAME
+--,pt.patientid
+--,pt.enterpriseid
+--,DATEDIFF(year, pt.dob, a.appointmentdate) as age
+--,pt.sex
+--,LEFT(pt.zip, 5) as zip
+,p.schedulingname
+,concat(p.providerlastname, ', ', p.providerfirstname) as physician_name
+,p.specialty
+,p.providertypecategory
+,p.providertype
+--,ap.appointmenttypename
+--,ap.appointmenttypeclass
+,a.appointmentstatus
+,A.APPOINTMENTCANCELLEDDATETIME AS APTCANCELLEDDATE
+,DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) AS TIMETOCANCEL
+,a.appointmentcancelreason
+,a.frozenyn
+,a.appointmentfrozenreason
+,(CASE
+    WHEN (DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) = 0 
+            AND
+            (A.APPOINTMENTCANCELREASON <> 'PATIENT NO SHOW'
+            OR UPPER(A.APPOINTMENTCANCELREASON) <> 'NO SHOW NO CALL')
+            )
+        THEN 'Same Day Cancellation'
+    WHEN DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) > 0
+        THEN 'Cancelled Before Scheduled Appointment'
+    WHEN (DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) < 0
+            OR
+            UPPER(A.APPOINTMENTCANCELREASON) IN ('PATIENT NO SHOW', 'NO SHOW NO CALL'))
+        THEN 'No Call, No Show'
+    WHEN APPOINTMENTSTATUS = '4 - Charge Entered'
+  THEN 'Attended'
+        ELSE 'Open Slot'
+    END) AS APPOINTMENT_STATUS_CAT
+from "ATHENAHEALTH"."ATHENAONE"."APPOINTMENT" a       
+join "ATHENAHEALTH"."ATHENAONE"."APPOINTMENTTYPE" ap on a.appointmenttypeid = ap.appointmenttypeid
+join "ATHENAHEALTH"."ATHENAONE"."DEPARTMENT" d on a.departmentid = d.departmentid
+join "ATHENAHEALTH"."ATHENAONE"."PROVIDER" p on a.schedulingproviderid = p.providerid
+left join "ATHENAHEALTH"."ATHENAONE"."PATIENT" pt on a.patientid = pT.patientid
+where year(a.appointmentdate) >= year(current_date()) - 3 -- AND year(a.appointmentdate) <= year(current_date()) - 1
+-- and a.appointmentdate <= current_date()
+AND (UPPER(DEPARTMENTNAME) LIKE 'TRYON MED%' OR UPPER(DEPARTMENTNAME) LIKE 'TMP%')
+and p.entitytype = 'Person'
+and (pt.patientstatus not in ('d', 'i') or pt.patientstatus is null)
+and upper(p.schedulingname) not like '%TEST%'
+and (pt.testpatientyn = 'N' or pt.testpatientyn is null)
+AND (FROZENYN = 'N' OR FROZENYN IS NULL)
+),
+df1 as (
+select distinct
+df.*
+,concat(appointmentdate, schedulingname, appointmentstarttime) as SLOT_ID
+,Row_number() over (partition by SLOT_ID order by appointmentcreateddatetime DESC) as SLOT_IDX -- Adding id to each appointment created within a time slot for specific doctor (Descending by date - most recent = 1)
+from df
+--where schedulingname like '%Alexander%'
+--and appointmentdate = '2021-03-09'
+--and appointmentstarttime = '09:15 AM'
+-- 04:00 PM
+--where schedulingname = 'Reams_Alicia' 
+  --AND appointmentdate = '2022-02-08' 
+  --AND appointmentstarttime = '04:00 PM'
+
+) ,
+
+-- Get df for most recent appointment slot update up until day of appointment and
+df2 as (
+SELECT 
+  SLOT_ID,  MAX(APPOINTMENTCREATEDDATETIME) AS APPOINTMENTCREATEDDATETIME FROM df1 --Selects most recently created appointment for particular slot
+  WHERE DATE(df1.APPOINTMENTCREATEDDATETIME) < df1.APPOINTMENTDATE
+  GROUP BY SLOT_ID 
+), -- SELECT * FROM df2 WHERE SLOT_ID = '2021-12-09Reed_Derek03:45 PM';,
+--Need to calculate filled slots (would be at start of morning)
+df3 as (
+SELECT df1.*, 
+  CASE 
+    --WHEN  APPOINTMENTSTATUS = '4 - Charge Entered' THEN 1 --Flags appointments that are filled going into the day
+    --WHEN APPOINTMENTSTATUS = 'x - Cancelled' AND APTCANCELLEDDATE >= APPOINTMENTDATE THEN 1 -- Case when appointment gets cancelled the day of - this would still be the last appointment row for the latest apt before the day of  
+    --WHEN APPOINTMENTSTATUS = 'f - Filled' THEN 1
+    WHEN APPOINTMENTSCHEDULEDDATETIME IS NOT NULL THEN 1
+  ELSE 0
+  END AS filled_before
+  FROM 
+df2 LEFT JOIN df1
+ON df2.SLOT_ID = df1.SLOT_ID AND df2.APPOINTMENTCREATEDDATETIME = df1.APPOINTMENTCREATEDDATETIME 
+) , --SELECT * FROM df2 WHERE SLOT_ID = '2021-12-09Reed_Derek03:45 PM';,
+-- Do same thing to flag appointment slots as filled or unfilled after the appointment date has passed
+df4 as (
+SELECT 
+  SLOT_ID, MAX(APPOINTMENTCREATEDDATETIME) AS APPOINTMENTCREATEDDATETIME FROM df1 --Selects most recently created appointment for particular slot
+  --WHERE DATE(df1.APPOINTMENTCREATEDDATETIME) < df1.APPOINTMENTDATE
+  GROUP BY SLOT_ID --no shows day of, % attended vs % prebooked
+),
+df5 AS (
+SELECT df1.*, CASE 
+    WHEN  APPOINTMENTSTATUS = '4 - Charge Entered' AND APPOINTMENTDATE <= current_date() - 14 THEN 1
+    WHEN (APPOINTMENTSTATUS = '4 - Charge Entered' OR APPOINTMENTSTATUS = '3 - Checked Out' OR APPOINTMENTSTATUS = '3 - Checked In') AND (APPOINTMENTDATE>current_date() - 14 ) THEN 1
+    ELSE 0
+  END AS filled_after
+ FROM 
+df4 LEFT JOIN df1
+ON df4.SLOT_ID = df1.SLOT_ID AND df4.APPOINTMENTCREATEDDATETIME = df1.APPOINTMENTCREATEDDATETIME
+) ,
+-- Get number of same-day booked slots - slots booked on the same day as the appointment
+df6 AS (
+SELECT df1.*, 
+  CASE 
+  WHEN DATE(APPOINTMENTSCHEDULEDDATETIME) = APPOINTMENTDATE THEN 1--AND APPOINTMENTSTATUS = '4 - Charge Entered' THEN 1 -- Just include appointments that were added and completed????
+  ELSE 0
+  END AS FILLED_DAYOF 
+  FROM df1 
+  WHERE FILLED_DAYOF = 1 -- ONLY SELECT THESE SO DOESN"T MESS UP LEFT JOIN
+) ,
+-- Get data frame of all appointment slots (ie ids)
+slots AS (
+SELECT DISTINCT SLOT_ID, APPOINTMENTSTARTTIME, APPOINTMENTDATE FROM df1
+)  ,
+-- Join onto slot ids the data for filled or unfilled for both before and after the day of the appointment
+result AS (
+SELECT slots.*,df5.schedulingname, FILLED_BEFORE, df5.filled_after, df6.FILLED_DAYOF, df5.specialty,df5.departmentName
+FROM 
+slots LEFT JOIN df3 ON slots.SLOT_ID = df3.SLOT_ID
+  LEFT JOIN df5 ON slots.SLOT_ID = df5.SLOT_ID
+  LEFT JOIN df6 ON slots.SLOT_ID = df6.SLOT_ID
+) ,
+-- Add AM/PM flag so that we can break down open/filled appointments by am/pm at start of day
+result2 AS (
+SELECT result.*, TIME(APPOINTMENTSTARTTIME) AS TIME_military,
+  CASE 
+    WHEN TIME(APPOINTMENTSTARTTIME) < '14:00:00' THEN 1
+    ELSE 0
+END AS AM, 
+  CASE 
+    WHEN TIME(APPOINTMENTSTARTTIME) >= '14:00:00' THEN 1
+    ELSE 0
+END AS PM
+   
+FROM  result
+) ,
+-- Get first open slot by provider and data
+first_open AS (
+SELECT 
+  SCHEDULINGNAME, APPOINTMENTDATE, SPECIALTY, DEPARTMENTNAME,
+  MIN(TIME_military) AS first_open
+FROM result2
+  WHERE (FILLED_BEFORE = 0 OR FILLED_BEFORE IS NULL)
+  GROUP BY SCHEDULINGNAME, APPOINTMENTDATE, SPECIALTY, DEPARTMENTNAME 
+),
+final AS (
+SELECT result2.*, first_open.FIRST_OPEN FROM 
+ result2 
+  LEFT JOIN first_open ON 
+  result2.SCHEDULINGNAME = first_open.SCHEDULINGNAME AND  
+  result2.APPOINTMENTDATE = first_open.APPOINTMENTDATE AND 
+  result2.SPECIALTY = first_open.SPECIALTY AND 
+  result2.DEPARTMENTNAME = first_open.DEPARTMENTNAME
+)
+SELECT DISTINCT * FROM final  -- WHERE SLOT_ID = '2021-12-09Reed_Derek03:45 PM'
+
+/* ,
+final AS (
+SELECT  
+  APPOINTMENTDATE, 
+  SCHEDULINGNAME, 
+  SPECIALTY, 
+  DEPARTMENTNAME, 
+  COUNT(SCHEDULINGNAME) AS TOTAL_SLOTS, 
+  SUM(FILLED_BEFORE) AS PRE_BOOKED,
+  SUM(FILLED_DAYOF) AS SCHEDULED_SAMEDAY, 
+  SUM(FILLED_AFTER) AS ATTENDED,
+  SUM(AM) AS TOTAL_AM,
+  SUM(PM) AS TOTAL_PM,
+  SUM(CASE WHEN AM = 1 AND (FILLED_BEFORE = 0 OR FILLED_BEFORE IS NULL) THEN 1 ELSE 0 END) AS  UNFILLED_AM,
+  SUM(CASE WHEN PM = 1 AND (FILLED_BEFORE = 0 OR FILLED_BEFORE IS NULL) THEN 1 ELSE 0 END) AS  UNFILLED_PM
+  FROM 
+result2 
+GROUP BY SCHEDULINGNAME, APPOINTMENTDATE, SPECIALTY, DEPARTMENTNAME) ,
+final2 AS (
+SELECT final.*, first_open.FIRST_OPEN FROM 
+ final 
+  LEFT JOIN first_open ON 
+  final.SCHEDULINGNAME = first_open.SCHEDULINGNAME AND  
+  final.APPOINTMENTDATE = first_open.APPOINTMENTDATE AND 
+  final.SPECIALTY = first_open.SPECIALTY AND 
+  final.DEPARTMENTNAME = first_open.DEPARTMENTNAME
+)
+--GROUP BY APPOINTMENTDATE)
+
+SELECT *, PRE_BOOKED/NULLIF(TOTAL_SLOTS,0) AS PERCENT_SCHEDULEDAHEAD, ATTENDED/NULLIF(TOTAL_SLOTS,0) AS PERCENT_ATTENDED FROM final2--WHERE FILLED_BEFORE != FILLED_AFTER;
+-- WHERE DEPARTMENTNAME = 'SouthPark8' AND SPECIALTY = 'Internal Medicine'
+-- APPOINTMENTSTARTTIME, APPOINTMENTDATE, FILLED_BEFORE, FILLED_AFTER
+
+-- FILLED_DAYOF/NULLIF((TOTAL_SLOTS-FILLED_BEFORE),0) AS PERCENT_OFUNFILLED_FILLED_DAYOF
+
+*/

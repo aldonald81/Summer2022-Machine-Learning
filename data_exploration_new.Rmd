@@ -1,0 +1,906 @@
+---
+title: "Data Exploration"
+output: 
+  html_document: 
+    code_folding: hide
+date: '2022-06-16'
+---
+
+# Take out filled slots - the doctor blocked out these time slots
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+## Research Question
+
+#### How can we predict the liklihood of a certain appointment slot going unfilled?
+
+### Methods
+Considering appointment slots between 7am and 5pm (not inclusive) during the weekday that are not frozen
+Not including filled appointments because doctor blocked them out
+
+
+## Loading libraries and creating connection to Athena
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+#library(Tryon)
+library(DBI)
+library(ggplot2)
+library(lubridate)
+library(data.table)
+library(zipcodeR)
+library(geodist)
+
+# Open Athena connection
+snow_snow <- DBI::dbConnect(
+  odbc::odbc(),
+  UID    = keyring::key_list("ATHENA")[1,2],
+  PWD    = keyring::key_get("ATHENA", keyring::key_list("ATHENA")[1,2]),
+  Server = "rl51365.snowflakecomputing.com",
+  Warehouse = "AH_WAREHOUSE",
+  Database = "ATHENAHEALTH",
+  Schema = "ATHENAONE",
+  Driver = "SnowflakeDSIIDriver" #MAKE SURE THIS IS THE RIGHT NAME
+)
+```
+
+
+## Loading initial data 
+```{sql connection = snow_snow, output.var = "slots"}
+
+with df as (SELECT
+a.parentappointmentid
+,a.appointmentid
+,a.appointmentdate
+,a.appointmentstarttime
+,a.appointmentcreateddatetime
+,(CASE WHEN D.DEPARTMENTNAME LIKE 'Tryon Med %' Then (REPLACE(D.DEPARTMENTNAME, 'Tryon Med - ', ''))
+    when D.DEPARTMENTNAME LIKE '%COVID%' then 'Tryon Med COVID Clinic - Pineville'
+    when D.DEPARTMENTNAME = 'Tryon Med-Asheville' Then 'Asheville'
+    when D.DEPARTMENTNAME LIKE '%SATELLITE%' then 'Tryon Med Satellite-Uptown 7th' END)
+    AS DEPARTMENTNAME
+,pt.patientid
+,pt.enterpriseid
+,DATEDIFF(year, pt.dob, a.appointmentdate) as age
+,pt.sex
+,LEFT(pt.zip, 5) as zip
+,p.schedulingname
+,concat(p.providerlastname, ', ', p.providerfirstname) as physician_name
+,p.specialty
+,p.providertypecategory
+,p.providertype
+,ap.appointmenttypename
+,ap.appointmenttypeclass
+,a.appointmentstatus
+,A.APPOINTMENTCANCELLEDDATETIME AS APTCANCELLEDDATE
+,DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) AS TIMETOCANCEL
+,a.appointmentcancelreason
+,a.frozenyn
+,a.appointmentfrozenreason
+,(CASE
+    WHEN (DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) = 0
+            AND
+            (A.APPOINTMENTCANCELREASON <> 'PATIENT NO SHOW'
+            OR UPPER(A.APPOINTMENTCANCELREASON) <> 'NO SHOW NO CALL')
+            )
+        THEN 'Same Day Cancellation'
+    WHEN DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) > 0
+        THEN 'Cancelled Before Scheduled Appointment'
+    WHEN (DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) < 0
+            OR
+            UPPER(A.APPOINTMENTCANCELREASON) IN ('PATIENT NO SHOW', 'NO SHOW NO CALL'))
+        THEN 'No Call, No Show'
+    WHEN APPOINTMENTSTATUS = '4 - Charge Entered'
+  THEN 'Attended'
+        ELSE 'Open Slot'
+    END) AS APPOINTMENT_STATUS_CAT
+            
+-- SELECTING other patient level data to add to model
+, pt.LANGUAGE
+, pt.CDCETHNICITYCODE  
+, pt.ETHNICITY
+, pt.CDCRACECODE 
+, pt.RACE
+, pt.ZIP AS PATIENT_ZIP
+, pt.DONOTCALLYN
+, pt.MARITALSTATUS
+, pt.REGISTRATIONDATE
+, pt.PROVIDERGROUPID
+, pt.UNCONFIRMEDFAMILYSIZE
+, pt.UNCONFIRMEDYEARLYINCOME
+, pt.SMSOPTINDATE 
+, d.LONGITUDE AS DEPARTMENT_LONGITUDE
+, d.LATITUDE AS DEPARTMENT_LATITUDE
+            
+from "ATHENAHEALTH"."ATHENAONE"."APPOINTMENT" a
+join "ATHENAHEALTH"."ATHENAONE"."APPOINTMENTTYPE" ap on a.appointmenttypeid = ap.appointmenttypeid
+join "ATHENAHEALTH"."ATHENAONE"."DEPARTMENT" d on a.departmentid = d.departmentid
+join "ATHENAHEALTH"."ATHENAONE"."PROVIDER" p on a.schedulingproviderid = p.providerid
+left join "ATHENAHEALTH"."ATHENAONE"."PATIENT" pt on a.patientid = pT.patientid
+where year(a.appointmentdate) >= year(current_date()) - 3
+and a.appointmentdate < current_date()
+AND (UPPER(DEPARTMENTNAME) LIKE 'TRYON MED%' OR UPPER(DEPARTMENTNAME) LIKE 'TMP%')
+and p.entitytype = 'Person'
+and (pt.patientstatus not in ('d', 'i') or pt.patientstatus is null)
+and upper(p.schedulingname) not like '%TEST%'
+and (pt.testpatientyn = 'N' or pt.testpatientyn is null)
+AND (FROZENYN = 'N' OR FROZENYN IS NULL)
+AND DAYOFWEEK(a.APPOINTMENTDATE) <> 0 AND DAYOFWEEK(a.APPOINTMENTDATE)<>6 -- FILTER OUT WEEKENDS
+AND (TIME(a.APPOINTMENTSTARTTIME) >= '07:00:00' AND TIME(a.APPOINTMENTSTARTTIME) < '17:00:00') --only slots between 7am and 5pm
+            
+),
+df1 as (
+select distinct
+df.*
+,concat(appointmentdate, schedulingname, appointmentstarttime) as SLOT_ID
+,Row_number() over (partition by SLOT_ID order by appointmentcreateddatetime DESC) as SLOT_IDX -- Adding id to each appointment created within a time slot for specific doctor (Descending by date - most recent = 1)
+from df 
+WHERE DEPARTMENTNAME != 'Randolph GI & IM' AND DEPARTMENTNAME != 'Virtual Connect'
+--where schedulingname like '%Alexander%'
+--and appointmentdate = '2021-03-08'
+--and appointmentstarttime = '08:30 AM'
+),
+df2 as (
+SELECT
+  df1.*,
+  LEAD(APPOINTMENTSTATUS,1, APPOINTMENTSTATUS)  -- looking to next row (back in time) to see the status of next most recent appointment
+  OVER (PARTITION BY [APPOINTMENTSTARTTIME],[SCHEDULINGNAME], [APPOINTMENTDATE]  -- Grouping by slot by doctor
+  ORDER BY SLOT_IDX DESC)  AS nextStatusType -- Order by latest to most recent appointments
+  FROM df1
+),
+df3 as (
+SELECT df2.*,
+CASE
+  WHEN APPOINTMENTSTATUS = 'x - Cancelled' AND SLOT_IDX <=2 AND nextStatusType = 'o - Open Slot' THEN 0 -- Case when the next appointment for slot is Open so must not have been filled -> therefore flag cancelled one so we can record that one
+  ELSE SLOT_IDX -- Otherwise keep the same
+END AS importance -- Gets flagged as 0 if most recent is listed as open but should be cancelled (flags cancelled appointment)
+FROM df2
+),
+--find most recent ACTUAL appointment for each slot
+df4 as (
+SELECT
+  APPOINTMENTDATE,
+  APPOINTMENTSTARTTIME,
+  SCHEDULINGNAME,
+  MIN(IMPORTANCE) AS importance_id -- Same as SLOT_IDX unless it was flagged as 0
+  FROM df3
+  GROUP BY APPOINTMENTDATE,APPOINTMENTSTARTTIME, SCHEDULINGNAME
+),
+df5 AS (
+  SELECT df3.*, DAYOFMONTH(df4.APPOINTMENTDATE) AS DAYOFMONTH, DAYNAME(df4.APPOINTMENTDATE) AS DAYOFWEEK, DAYOFYEAR(df4.APPOINTMENTDATE) AS DAYOFYEAR, MONTHNAME(df4.APPOINTMENTDATE) AS MONTH, YEAR(df4.APPOINTMENTDATE) AS YEAR, TIME(df4.APPOINTMENTSTARTTIME) AS APPOINTMENTSTARTTIME_military, HOUR(TIME(df4.APPOINTMENTSTARTTIME)) AS APPOINTMENTSTARTTIME_hour FROM
+df4 LEFT JOIN df3
+ON df3.APPOINTMENTDATE = df4.APPOINTMENTDATE
+    AND df3.APPOINTMENTSTARTTIME = df4.APPOINTMENTSTARTTIME
+    AND df3.SCHEDULINGNAME = df4.SCHEDULINGNAME
+    AND df3.IMPORTANCE = df4.importance_id
+) ,
+-- Getting no show count history per patient
+df6 as (
+SELECT PATIENTID, IFNULL(COUNT(PATIENTID),0) AS NOSHOW_COUNT FROM df5
+WHERE APPOINTMENT_STATUS_CAT = 'No Call, No Show'
+GROUP BY PATIENTID
+)  ,
+df7 as (
+SELECT df5.PATIENTID, 
+  YEAR, DAYOFYEAR, DAYOFMONTH, DAYOFWEEK, MONTH, 
+  APPOINTMENTSTARTTIME_HOUR, SPECIALTY,
+  AGE, SEX, 
+  CASE WHEN LANGUAGE = 'English' THEN 'ENGLISH' ELSE 'Other' END AS LANGUAGE
+  
+  , CASE 
+        WHEN CDCRACECODE = '1002-5' THEN 'American Indian or Alaska Native'
+        WHEN CDCRACECODE = '2028-9' THEN 'Asian'
+        WHEN CDCRACECODE = '2054-5' THEN 'Black or African American'
+        WHEN CDCRACECODE = '2076-8' THEN 'Native Hawaiian or Other Pacific Islander'
+        -- WHEN CDCRACECODE = '2131-1' THEN 'Other Race'
+        WHEN CDCRACECODE = '2106-3' THEN 'White'
+        WHEN RACE = 'Patient Declined' AND CDCRACECODE IS NULL THEN 'Patient Declined'
+        ELSE 'Other'
+    END AS RACE
+  , CASE 
+        WHEN ETHNICITY = 'Not Hispanic or Latino' THEN 'Non-Hispanic or Latin American'
+        WHEN ETHNICITY = 'Patient Declined' THEN 'Patient Declined'
+        ELSE 'Hispanic or Latin American'
+    END AS ETHNICITY
+  --, CASE 
+   -- WHEN RACE = 'Asian' THEN 'Asian' 
+   -- WHEN RACE = 'White' OR RACE = 'European' THEN 'Caucasian' 
+   -- WHEN RACE = 'African American' OR RACE = 'Black' OR 'Black or African American' THEN 'African American' 
+   -- WHEN RACE = 'Hispanic' THEN
+   -- WHEN RACE = 'Patient Declined' THEN 'Patient Declined'
+  
+
+  ,PATIENT_ZIP
+  ,DEPARTMENT_LONGITUDE
+  ,DEPARTMENT_LATITUDE
+--  ,DONOTCALLYN --Only 66 rows with 'Y' so don't think its good indicator
+  ,CASE 
+    WHEN MARITALSTATUS = 'DIVORCED' OR MARITALSTATUS = 'SEPARATED' OR MARITALSTATUS = 'SINGLE' OR MARITALSTATUS = 'WIDOWED' THEN 'Single'
+    WHEN MARITALSTATUS = 'MARRIED' OR MARITALSTATUS = 'PARTNER' THEN 'PARTNER'
+    ELSE 'OTHER'
+  END AS MARITALSTATUS
+    
+--  ,REGISTRATIONDATE  -- POSSIBLY ADD LATER
+--  ,PROVIDERGROUPID
+--  ,UNCONFIRMEDFAMILYSIZE
+--  ,UNCONFIRMEDYEARLYINCOME
+  ,CASE WHEN SMSOPTINDATE IS NOT NULL THEN 'Y' ELSE 'N' END AS SMSOPTIN
+  ,NOSHOW_COUNT,  
+  APPOINTMENTCREATEDDATETIME, APPOINTMENTDATE, DEPARTMENTNAME, APPOINTMENTSTATUS, APPOINTMENT_STATUS_CAT, 
+  DATEDIFF(day, APPOINTMENTCREATEDDATETIME, APPOINTMENTDATE) AS DATE_DIFF FROM
+df5 LEFT JOIN df6
+ON df5.PATIENTID = df6.PATIENTID
+) 
+SELECT *, 
+    CASE 
+        WHEN DATE_DIFF <= 3 THEN '0-3'
+        WHEN DATE_DIFF <= 130 AND DATE_DIFF > 3 THEN '4-130'
+        WHEN DATE_DIFF <= 649 AND DATE_DIFF > 130 THEN '131-649'
+        WHEN DATE_DIFF > 649 THEN '>649'
+     END AS DATE_DIFF_CATEGORY,
+     CASE 
+        WHEN AGE <= 26 THEN '<=26'
+        WHEN AGE <= 34 AND AGE > 26 THEN '27-34'
+        WHEN AGE <= 39 AND AGE > 34 THEN '35-39'
+        WHEN AGE <= 53 AND AGE > 39 THEN '40-53'
+        WHEN AGE <= 64 AND AGE > 53 THEN '54-64'
+        WHEN AGE <= 82 AND AGE > 64 THEN '65-82'
+        WHEN  AGE > 82 THEN '>82'
+      END AS AGE_CATEGORY,
+     CASE  --ADDING A KNOT in age continuous variable
+        WHEN AGE >= 75 THEN AGE - 75
+        ELSE 0
+     END AS AGE_AFTER75,
+     CASE 
+        WHEN AGE < 75 THEN AGE 
+        ELSE 75
+     END AS AGE_BEFORE75
+      
+FROM df7
+
+
+```
+
+
+
+
+#Save data and add in a distance metric
+```{r}
+slots$PATIENT_ZIP <- gsub("-.*","",slots$PATIENT_ZIP)
+
+## Convert the zip codes to data.table so we can join on them
+## I'm using the centroid of the zipcodes (lng and lat).
+## If you want the distance to the endge of the zipcode boundary you'll
+## need to convert this into a spatial data set
+dt_zips <- as.data.table( zip_code_db[, c("zipcode", "lng", "lat")])
+
+slots <- left_join(slots, dt_zips, by=c("PATIENT_ZIP"= "zipcode"), all.x = TRUE)
+names(slots)[names(slots) == 'lng'] <- "PATIENT_LONGITUDE"
+names(slots)[names(slots) == 'lat'] <- "PATIENT_LATITUDE"
+
+
+## convert the input data.frame into a data.table
+setDT( slots )
+
+slots <- slots %>% 
+  dplyr::mutate("dist" = geodist_vec(PATIENT_LONGITUDE, PATIENT_LATITUDE, DEPARTMENT_LONGITUDE, DEPARTMENT_LATITUDE, paired = TRUE,measure = 'geodesic')/1609) #convert to miles
+
+
+avg <- slots %>%
+  filter(is.na(dist) == FALSE)
+  
+avg <- mean(avg$dist)
+
+slots <- slots %>%
+  dplyr::mutate("DISTANCE_miles" = case_when(is.na(dist) ~ avg, TRUE ~ dist))
+
+slots <- subset(slots, select = -c(dist, PATIENT_ZIP))
+
+save(slots, file='model_data_updated.RData')
+```
+
+
+## Breaking down and visualizing this data to identify trends
+
+### Open Percentage over time
+```{r}
+
+#Group by day and slot status to get open percentage for each day
+slots1 <- slots %>%
+  # Need to add column to combine open and closed slots to count in summarise after group by
+  mutate(slot_open = case_when(APPOINTMENTSTATUS == 'o - Open Slot' ~ 1,
+                               APPOINTMENTSTATUS == 'x - Cancelled' ~ 1, 
+                               APPOINTMENTSTATUS =='3 - Checked Out' ~ 1,
+                               APPOINTMENTSTATUS =='2 - Checked In' ~ 1,
+                               APPOINTMENTSTATUS == 'f - Filled' ~ 1,
+                               APPOINTMENTSTATUS == '4 - Charge Entered' ~ 0,
+                               TRUE ~ 0)) %>%
+  # Select date and slot open columns for this exploration
+  select(APPOINTMENTDATE, slot_open)
+
+# Create table for total number of OPEN slots for each day
+open_slots <- slots1 %>%
+  group_by(APPOINTMENTDATE) %>%
+  summarise(open_slots = sum(slot_open)) # gets the total number of OPEN slots per day
+
+
+# Create table for total number of ALL slots for each day
+total_slots <- slots1 %>%
+  group_by(APPOINTMENTDATE) %>%
+  summarise(total_slots = n()) # gets the total number of TOTAL slots per day
+
+
+df <- dplyr::left_join(total_slots, open_slots, by='APPOINTMENTDATE') %>%
+  mutate(open_percentage = open_slots/total_slots)
+
+print(df)
+
+
+# plot the data using ggplot
+df %>%
+  ggplot(aes(x = APPOINTMENTDATE, y = open_percentage)) +
+  geom_point() +
+  labs(x = "Date",
+    y = "Unfilled Slot percentage",
+    title = "Unfilled Slot Percentage Over Time",
+    subtitle = "Dates to 2019") + geom_smooth( ) + ylim(0,1) 
+
+
+```
+
+
+Appears that as Tryon Medical has gotten established, there Open Slot percentage has remained relatively consistant between .35 and .50
+
+### Are there more open slots during different times of the year? (months)
+```{r}
+
+#Group by day and slot status to get open percentage for each day
+slots1 <- slots %>%
+  # Need to add column to combine open and closed slots to count in summarise after group by
+  mutate(slot_open = case_when(APPOINTMENTSTATUS == 'o - Open Slot' ~ 1,
+                               APPOINTMENTSTATUS == 'x - Cancelled' ~ 1, 
+                               APPOINTMENTSTATUS =='3 - Checked Out' ~ 1,
+                               APPOINTMENTSTATUS =='2 - Checked In' ~ 1,
+                               APPOINTMENTSTATUS == 'f - Filled' ~ 1,
+                               APPOINTMENTSTATUS == '4 - Charge Entered' ~ 0,
+                               TRUE ~ 0)) %>%
+  mutate(month = month(APPOINTMENTDATE)) %>% #from the lubridate library
+  mutate(year = year(APPOINTMENTDATE))%>%
+  # Select date and slot open columns for this exploration
+  select(month, year, slot_open)
+
+
+
+# Create table for total number of OPEN slots for each day
+open_slots <- slots1 %>%
+  group_by(month, year) %>%
+  summarise(open_slots = sum(slot_open))  # gets the total number of OPEN slots per day
+  
+
+
+
+# Create table for total number of ALL slots for each day
+total_slots <- slots1 %>%
+  group_by(month, year) %>%
+  summarise(total_slots = n()) # gets the total number of TOTAL slots per day
+
+df <- dplyr::left_join(total_slots, open_slots, by=c('month','year')) %>%
+  mutate(open_percentage = open_slots/total_slots)
+
+print(df)
+
+
+
+# plot the data using ggplot
+df %>%
+  ggplot(aes(x = month, y = open_percentage, color=year)) +
+  labs(x = "Month",
+    y = "Unfilled Slot percentage",
+    title = "Unfilled Slot Percentage per Month",
+    subtitle = "Dates to 2019") + geom_smooth( se=FALSE)
+
+
+
+
+
+```
+
+
+August through November seem to be the peak months for Open Slot percentage. This could be because school is back in session and appointments are cancelled or not booked for the end of the summer and start of the fall.
+
+### Open Percentage for each time slot
+```{r}
+
+#Group by day and slot status to get open percentage for each day
+slots2 <- slots %>%
+  # Need to add column to combine open and closed slots to count in summarise after group by
+  mutate(slot_open = case_when(APPOINTMENTSTATUS == 'o - Open Slot' ~ 1,
+                               APPOINTMENTSTATUS == 'x - Cancelled' ~ 1, 
+                               APPOINTMENTSTATUS =='3 - Checked Out' ~ 1,
+                               APPOINTMENTSTATUS =='2 - Checked In' ~ 1,
+                               APPOINTMENTSTATUS == 'f - Filled' ~ 1,
+                               APPOINTMENTSTATUS == '4 - Charge Entered' ~ 0,
+                               TRUE ~ 0)) %>%
+  select(APPOINTMENTDATE, APPOINTMENTSTARTTIME_HOUR, slot_open)
+
+
+# Create table for total number of OPEN slots for each slot time
+open_slots <- slots2 %>%
+  group_by(APPOINTMENTSTARTTIME_HOUR) %>%
+  summarise(open_slots = sum(slot_open)) # gets the total number of OPEN slots slot period
+
+
+# Create table for total count for a specific START_TIME period
+total_slots <- slots2 %>%
+  group_by(APPOINTMENTSTARTTIME_HOUR) %>%
+  summarise(total_slots = n()) # gets the total number of TOTAL slots per slot period
+
+
+df <- dplyr::left_join(total_slots, open_slots, by='APPOINTMENTSTARTTIME_HOUR') %>%
+  mutate(open_percentage = open_slots/total_slots)
+
+print(df)
+
+
+# plot the data using ggplot
+df %>%
+  #filter(total_slots >= 2000) %>%
+  ggplot(aes(x = APPOINTMENTSTARTTIME_HOUR, y = open_percentage)) +
+  geom_bar(stat="identity") +
+  labs(x = "Hour of the Day",
+    y = "Unfilled Slot percentage",
+    title = "Unfilled Slot Percentage by Time of Day",
+    subtitle = "Dates to 2019")
+
+```
+
+
+It appears that the lowest Open Slot percentage is during the early morning (i.e. 6am) and is highest in the evening hours. This makes sense as the evening hours tend to be a little more hectic leaving work/school
+
+
+
+### Break down by specialty to see if any particular type of doctor has higher open slot percentage
+```{r}
+
+#unique(slots$SPECIALTY)
+
+#Group by day and slot status to get open percentage for each day
+slots3 <- slots %>%
+  # Need to add column to combine open and closed slots to count in summarise after group by
+  mutate(slot_open = case_when(APPOINTMENTSTATUS == 'o - Open Slot' ~ 1,
+                               APPOINTMENTSTATUS == 'x - Cancelled' ~ 1, 
+                               APPOINTMENTSTATUS =='3 - Checked Out' ~ 1,
+                               APPOINTMENTSTATUS =='2 - Checked In' ~ 1,
+                               APPOINTMENTSTATUS == 'f - Filled' ~ 1,
+                               APPOINTMENTSTATUS == '4 - Charge Entered' ~ 0,
+                               TRUE ~ 0)) %>%
+  select(APPOINTMENTDATE, SPECIALTY, slot_open)
+
+
+# Create table for total number of OPEN slots for each slot time
+open_slots <- slots3 %>%
+  group_by(SPECIALTY) %>%
+  summarise(open_slots = sum(slot_open)) # gets the total number of OPEN slots slot period
+
+
+# Create table for total count for a specific START_TIME period
+total_slots <- slots3 %>%
+  group_by(SPECIALTY) %>%
+  summarise(total_slots = n()) # gets the total number of TOTAL slots per slot period
+
+
+df <- dplyr::left_join(total_slots, open_slots, by='SPECIALTY') %>%
+  mutate(open_percentage = open_slots/total_slots)
+
+print(df)
+
+
+# plot the data using ggplot
+df %>%
+  ggplot(aes(x = open_percentage, y = fct_reorder(SPECIALTY, open_percentage))) +
+  geom_bar(stat="identity") +
+  labs(x = "Unfilled Slot percentage",
+    y = "Specialty",
+    title = "Unfilled Slot Percentage by Provider Specialty",
+    subtitle = "Dates to 2019")
+
+```
+
+
+
+# Appointmenttypename and departmentname -- explore -- both have over 100 distinct values - could still include in model
+
+### Break down by department name to see variance by location
+```{r}
+
+#Group by day and slot status to get open percentage for each day
+slots4 <- slots %>%
+  # Need to add column to combine open and closed slots to count in summarise after group by
+  mutate(slot_open = case_when(APPOINTMENTSTATUS == 'o - Open Slot' ~ 1,
+                               APPOINTMENTSTATUS == 'x - Cancelled' ~ 1, 
+                               APPOINTMENTSTATUS =='3 - Checked Out' ~ 1,
+                               APPOINTMENTSTATUS =='2 - Checked In' ~ 1,
+                               APPOINTMENTSTATUS == 'f - Filled' ~ 1,
+                               APPOINTMENTSTATUS == '4 - Charge Entered' ~ 0,
+                               TRUE ~ 0)) %>%
+  select(DEPARTMENTNAME, slot_open)
+
+
+# Create table for total number of OPEN slots for each slot time
+open_slots <- slots4 %>%
+  group_by(DEPARTMENTNAME) %>%
+  summarise(open_slots = sum(slot_open)) # gets the total number of OPEN slots slot period
+
+
+# Create table for total count for a specific START_TIME period
+total_slots <- slots4 %>%
+  group_by(DEPARTMENTNAME) %>%
+  summarise(total_slots = n()) # gets the total number of TOTAL slots per slot period
+
+
+df <- dplyr::left_join(total_slots, open_slots, by='DEPARTMENTNAME') %>%
+  mutate(open_percentage = open_slots/total_slots)
+
+print(df)
+
+unique(df$DEPARTMENTNAME)
+
+
+# plot the data using ggplot
+df %>%
+  filter(total_slots > 100) %>%
+  ggplot(aes(x = open_percentage, y = fct_reorder(DEPARTMENTNAME, open_percentage))) + 
+  geom_bar(stat="identity") +
+  labs(x = "Unfilled Slot percentage",
+    y = "Department Name",
+    title = "Unfilled Slot Percentage by Department (Total slots > 100)",
+    subtitle = "Dates to 2019")
+
+```
+
+
+
+
+
+# Exploring the filled slots at the start of the day vs completed slots at the end of the day
+
+## Loading initial data 
+```{sql connection = snow_snow, output.var = "slots_before_after"}
+
+with df as (SELECT
+a.parentappointmentid
+,a.appointmentid
+,a.appointmentdate
+,a.appointmentstarttime
+,a.appointmentcreateddatetime
+,(CASE WHEN D.DEPARTMENTNAME LIKE 'Tryon Med %' Then (REPLACE(D.DEPARTMENTNAME, 'Tryon Med - ', ''))
+    when D.DEPARTMENTNAME LIKE '%COVID%' then 'Tryon Med COVID Clinic - Pineville'
+    when D.DEPARTMENTNAME = 'Tryon Med-Asheville' Then 'Asheville'
+    when D.DEPARTMENTNAME LIKE '%SATELLITE%' then 'Tryon Med Satellite-Uptown 7th' END)
+    AS DEPARTMENTNAME
+--,pt.patientid
+--,pt.enterpriseid
+--,DATEDIFF(year, pt.dob, a.appointmentdate) as age
+--,pt.sex
+--,LEFT(pt.zip, 5) as zip
+,p.schedulingname
+,concat(p.providerlastname, ', ', p.providerfirstname) as physician_name
+,p.specialty
+,p.providertypecategory
+,p.providertype
+--,ap.appointmenttypename
+--,ap.appointmenttypeclass
+,a.appointmentstatus
+,A.APPOINTMENTCANCELLEDDATETIME AS APTCANCELLEDDATE
+,DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) AS TIMETOCANCEL
+,a.appointmentcancelreason
+,a.frozenyn
+,a.appointmentfrozenreason
+,(CASE
+    WHEN (DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) = 0 
+            AND
+            (A.APPOINTMENTCANCELREASON <> 'PATIENT NO SHOW'
+            OR UPPER(A.APPOINTMENTCANCELREASON) <> 'NO SHOW NO CALL')
+            )
+        THEN 'Same Day Cancellation'
+    WHEN DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) > 0
+        THEN 'Cancelled Before Scheduled Appointment'
+    WHEN (DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) < 0
+            OR
+            UPPER(A.APPOINTMENTCANCELREASON) IN ('PATIENT NO SHOW', 'NO SHOW NO CALL'))
+        THEN 'No Call, No Show'
+    WHEN APPOINTMENTSTATUS = '4 - Charge Entered'
+  THEN 'Attended'
+        ELSE 'Open Slot'
+    END) AS APPOINTMENT_STATUS_CAT
+from "ATHENAHEALTH"."ATHENAONE"."APPOINTMENT" a       
+join "ATHENAHEALTH"."ATHENAONE"."APPOINTMENTTYPE" ap on a.appointmenttypeid = ap.appointmenttypeid
+join "ATHENAHEALTH"."ATHENAONE"."DEPARTMENT" d on a.departmentid = d.departmentid
+join "ATHENAHEALTH"."ATHENAONE"."PROVIDER" p on a.schedulingproviderid = p.providerid
+left join "ATHENAHEALTH"."ATHENAONE"."PATIENT" pt on a.patientid = pT.patientid
+where year(a.appointmentdate) >= year(current_date()) - 3
+and a.appointmentdate <= current_date()
+AND (UPPER(DEPARTMENTNAME) LIKE 'TRYON MED%' OR UPPER(DEPARTMENTNAME) LIKE 'TMP%')
+and p.entitytype = 'Person'
+and (pt.patientstatus not in ('d', 'i') or pt.patientstatus is null)
+and upper(p.schedulingname) not like '%TEST%'
+and (pt.testpatientyn = 'N' or pt.testpatientyn is null)
+),
+df1 as (
+select distinct
+df.*
+,concat(appointmentdate, schedulingname, appointmentstarttime) as SLOT_ID
+,Row_number() over (partition by SLOT_ID order by appointmentcreateddatetime DESC) as SLOT_IDX -- Adding id to each appointment created within a time slot for specific doctor (Descending by date - most recent = 1)
+from df
+where schedulingname like '%Alexander%'
+--and appointmentdate = '2021-03-09'
+--and appointmentstarttime = '09:15 AM'
+-- 04:00 PM
+--where schedulingname = 'Reams_Alicia' 
+  --AND appointmentdate = '2022-02-08' 
+  --AND appointmentstarttime = '04:00 PM'
+
+),
+
+-- Get df for most recent appointment slot update up until day of appointment and
+df2 as (
+SELECT 
+  SLOT_ID, MAX(APPOINTMENTCREATEDDATETIME) AS APPOINTMENTCREATEDDATETIME FROM df1 --Selects most recently created appointment for particular slot
+  WHERE DATE(df1.APPOINTMENTCREATEDDATETIME) < df1.APPOINTMENTDATE
+  GROUP BY SLOT_ID 
+),
+--Need to calculate filled slots (would be at start of morning)
+df3 as (
+SELECT df1.*, 
+  CASE 
+    WHEN  APPOINTMENTSTATUS = '4 - Charge Entered' THEN 1 --Flags appointments that are filled going into the day
+    WHEN APPOINTMENTSTATUS = 'x - Cancelled' AND APTCANCELLEDDATE >= APPOINTMENTDATE THEN 1 -- Case when appointment gets cancelled the day of - this would still be the last appointment row for the latest apt before the day of  
+  ELSE 0
+  END AS filled_before
+  FROM 
+df2 LEFT JOIN df1
+ON df2.SLOT_ID = df1.SLOT_ID AND df2.APPOINTMENTCREATEDDATETIME = df1.APPOINTMENTCREATEDDATETIME
+),
+-- Do same thing to flag appointment slots as filled or unfilled after the appointment date has passed
+df4 as (
+SELECT 
+  SLOT_ID, MAX(APPOINTMENTCREATEDDATETIME) AS APPOINTMENTCREATEDDATETIME FROM df1 --Selects most recently created appointment for particular slot
+  --WHERE DATE(df1.APPOINTMENTCREATEDDATETIME) < df1.APPOINTMENTDATE
+  GROUP BY SLOT_ID
+),
+df5 AS (
+SELECT df1.*, CASE 
+    WHEN  APPOINTMENTSTATUS = '4 - Charge Entered' THEN 1 --Flags appointments that are filled going into the day -- ONLY way it will be filled at end of day is if someone USED the slot
+    ELSE 0
+  END AS filled_after
+ FROM 
+df4 LEFT JOIN df1
+ON df4.SLOT_ID = df1.SLOT_ID AND df4.APPOINTMENTCREATEDDATETIME = df1.APPOINTMENTCREATEDDATETIME
+) ,
+-- Get data frame of all appointment slots (ie ids)
+slots AS (
+SELECT DISTINCT SLOT_ID, APPOINTMENTSTARTTIME, APPOINTMENTDATE FROM df1
+),
+-- Join onto slot ids the data for filled or unfilled for both before and after the day of the appointment
+result AS (
+SELECT slots.*,FILLED_BEFORE
+FROM 
+slots LEFT JOIN df3 ON slots.SLOT_ID = df3.SLOT_ID
+),
+result2 AS (
+SELECT result.*, df5.schedulingname, df5.filled_after FROM
+result LEFT JOIN df5 ON result.SLOT_ID = df5.SLOT_ID),
+final AS (
+SELECT SCHEDULINGNAME, APPOINTMENTDATE, SUM(FILLED_AFTER) AS FILLED_AFTER, SUM(FILLED_BEFORE) AS FILLED_BEFORE FROM 
+result2 
+GROUP BY SCHEDULINGNAME, APPOINTMENTDATE)
+
+
+SELECT * FROM final--WHERE FILLED_BEFORE != FILLED_AFTER;
+-- APPOINTMENTSTARTTIME, APPOINTMENTDATE, FILLED_BEFORE, FILLED_AFTER
+
+
+
+
+ 
+```
+
+```{r }
+library(tidyr)
+df2 <- tidyr::pivot_longer(slots_before_after, cols=c('FILLED_BEFORE', 'FILLED_AFTER'), names_to='variable', 
+values_to="value")
+head(df2)
+
+df2 %>%
+  filter(APPOINTMENTDATE >= '2022-06-06' & APPOINTMENTDATE <= '2022-06-10')%>%
+  ggplot(aes(x=APPOINTMENTDATE, y=value, fill=variable)) +
+    geom_bar(stat='identity', position='dodge') + 
+  labs(x = "Date",
+    y = "Slots Filled",
+    title = "Slots filled before and after an appointment date",
+    subtitle = "For Dr. Alexander James")
+
+
+
+
+```
+
+
+
+
+## I wonder if would be better for correlation to seperate cancellation and open 
+
+
+
+
+# How are doctors offices doing at filling unfilled slots the day of
+
+## Loading initial data 
+```{sql connection = snow_snow, output.var = "day_of"}
+with df as (SELECT
+a.parentappointmentid
+,a.appointmentid
+,a.appointmentdate
+,a.appointmentstarttime
+,a.appointmentcreateddatetime
+,(CASE WHEN D.DEPARTMENTNAME LIKE 'Tryon Med %' Then (REPLACE(D.DEPARTMENTNAME, 'Tryon Med - ', ''))
+    when D.DEPARTMENTNAME LIKE '%COVID%' then 'Tryon Med COVID Clinic - Pineville'
+    when D.DEPARTMENTNAME = 'Tryon Med-Asheville' Then 'Asheville'
+    when D.DEPARTMENTNAME LIKE '%SATELLITE%' then 'Tryon Med Satellite-Uptown 7th' END)
+    AS DEPARTMENTNAME
+--,pt.patientid
+--,pt.enterpriseid
+--,DATEDIFF(year, pt.dob, a.appointmentdate) as age
+--,pt.sex
+--,LEFT(pt.zip, 5) as zip
+,p.schedulingname
+,concat(p.providerlastname, ', ', p.providerfirstname) as physician_name
+,p.specialty
+,p.providertypecategory
+,p.providertype
+--,ap.appointmenttypename
+--,ap.appointmenttypeclass
+,a.appointmentstatus
+,A.APPOINTMENTCANCELLEDDATETIME AS APTCANCELLEDDATE
+,DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) AS TIMETOCANCEL
+,a.appointmentcancelreason
+,a.frozenyn
+,a.appointmentfrozenreason
+,(CASE
+    WHEN (DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) = 0 
+            AND
+            (A.APPOINTMENTCANCELREASON <> 'PATIENT NO SHOW'
+            OR UPPER(A.APPOINTMENTCANCELREASON) <> 'NO SHOW NO CALL')
+            )
+        THEN 'Same Day Cancellation'
+    WHEN DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) > 0
+        THEN 'Cancelled Before Scheduled Appointment'
+    WHEN (DATEDIFF(day, A.APPOINTMENTCANCELLEDDATETIME, A.APPOINTMENTDATE) < 0
+            OR
+            UPPER(A.APPOINTMENTCANCELREASON) IN ('PATIENT NO SHOW', 'NO SHOW NO CALL'))
+        THEN 'No Call, No Show'
+    WHEN APPOINTMENTSTATUS = '4 - Charge Entered'
+  THEN 'Attended'
+        ELSE 'Open Slot'
+    END) AS APPOINTMENT_STATUS_CAT
+from "ATHENAHEALTH"."ATHENAONE"."APPOINTMENT" a       
+join "ATHENAHEALTH"."ATHENAONE"."APPOINTMENTTYPE" ap on a.appointmenttypeid = ap.appointmenttypeid
+join "ATHENAHEALTH"."ATHENAONE"."DEPARTMENT" d on a.departmentid = d.departmentid
+join "ATHENAHEALTH"."ATHENAONE"."PROVIDER" p on a.schedulingproviderid = p.providerid
+left join "ATHENAHEALTH"."ATHENAONE"."PATIENT" pt on a.patientid = pT.patientid
+where year(a.appointmentdate) >= year(current_date()) - 3 AND year(a.appointmentdate) <= year(current_date()) - 1
+and a.appointmentdate <= current_date()
+AND (UPPER(DEPARTMENTNAME) LIKE 'TRYON MED%' OR UPPER(DEPARTMENTNAME) LIKE 'TMP%')
+and p.entitytype = 'Person'
+and (pt.patientstatus not in ('d', 'i') or pt.patientstatus is null)
+and upper(p.schedulingname) not like '%TEST%'
+and (pt.testpatientyn = 'N' or pt.testpatientyn is null)
+),
+df1 as (
+select distinct
+df.*
+,concat(appointmentdate, schedulingname, appointmentstarttime) as SLOT_ID
+,Row_number() over (partition by SLOT_ID order by appointmentcreateddatetime DESC) as SLOT_IDX -- Adding id to each appointment created within a time slot for specific doctor (Descending by date - most recent = 1)
+from df
+--where schedulingname like '%Alexander%'
+--and appointmentdate = '2021-03-09'
+--and appointmentstarttime = '09:15 AM'
+-- 04:00 PM
+--where schedulingname = 'Reams_Alicia' 
+  --AND appointmentdate = '2022-02-08' 
+  --AND appointmentstarttime = '04:00 PM'
+
+),
+
+-- Get df for most recent appointment slot update up until day of appointment and
+df2 as (
+SELECT 
+  SLOT_ID, MAX(APPOINTMENTCREATEDDATETIME) AS APPOINTMENTCREATEDDATETIME FROM df1 --Selects most recently created appointment for particular slot
+  WHERE DATE(df1.APPOINTMENTCREATEDDATETIME) < df1.APPOINTMENTDATE
+  GROUP BY SLOT_ID 
+),
+--Need to calculate filled slots (would be at start of morning)
+df3 as (
+SELECT df1.*, 
+  CASE 
+    WHEN  APPOINTMENTSTATUS = '4 - Charge Entered' THEN 1 --Flags appointments that are filled going into the day
+    WHEN APPOINTMENTSTATUS = 'x - Cancelled' AND APTCANCELLEDDATE >= APPOINTMENTDATE THEN 1 -- Case when appointment gets cancelled the day of - this would still be the last appointment row for the latest apt before the day of  
+  ELSE 0
+  END AS filled_before
+  FROM 
+df2 LEFT JOIN df1
+ON df2.SLOT_ID = df1.SLOT_ID AND df2.APPOINTMENTCREATEDDATETIME = df1.APPOINTMENTCREATEDDATETIME
+),
+-- Do same thing to flag appointment slots as filled or unfilled after the appointment date has passed
+df4 as (
+SELECT 
+  SLOT_ID, MAX(APPOINTMENTCREATEDDATETIME) AS APPOINTMENTCREATEDDATETIME FROM df1 --Selects most recently created appointment for particular slot
+  --WHERE DATE(df1.APPOINTMENTCREATEDDATETIME) < df1.APPOINTMENTDATE
+  GROUP BY SLOT_ID --no shows day of, % attended vs % prebooked
+),
+df5 AS (
+SELECT df1.*, CASE 
+    WHEN  APPOINTMENTSTATUS = '4 - Charge Entered' THEN 1 --Flags appointments that are filled going into the day -- ONLY way it will be filled at end of day is if someone USED the slot
+    ELSE 0
+  END AS filled_after
+ FROM 
+df4 LEFT JOIN df1
+ON df4.SLOT_ID = df1.SLOT_ID AND df4.APPOINTMENTCREATEDDATETIME = df1.APPOINTMENTCREATEDDATETIME
+) ,
+-- Get number of same-day booked slots - slots booked on the same day as the appointment
+df6 AS (
+SELECT df1.*, 
+  CASE 
+  WHEN DATE(APPOINTMENTCREATEDDATETIME) = APPOINTMENTDATE AND APPOINTMENTSTATUS = '4 - Charge Entered' THEN 1 -- Just include appointments that were added and completed????
+  ELSE 0
+  END AS FILLED_DAYOF 
+  FROM df1 
+  WHERE FILLED_DAYOF = 1 -- ONLY SELECT THESE SO DOESN"T MESS UP LEFT JOIN
+) ,
+-- Get data frame of all appointment slots (ie ids)
+slots AS (
+SELECT DISTINCT SLOT_ID, APPOINTMENTSTARTTIME, APPOINTMENTDATE FROM df1
+) ,
+-- Join onto slot ids the data for filled or unfilled for both before and after the day of the appointment
+result AS (
+SELECT slots.*,df5.schedulingname, FILLED_BEFORE, df5.filled_after, df6.FILLED_DAYOF, df5.specialty,df5.departmentName
+FROM 
+slots LEFT JOIN df3 ON slots.SLOT_ID = df3.SLOT_ID
+  LEFT JOIN df5 ON slots.SLOT_ID = df5.SLOT_ID
+  LEFT JOIN df6 ON slots.SLOT_ID = df6.SLOT_ID
+),
+
+final AS (
+SELECT  APPOINTMENTDATE, SCHEDULINGNAME, SPECIALTY, DEPARTMENTNAME, COUNT(SCHEDULINGNAME) AS TOTAL_SLOTS, SUM(FILLED_BEFORE) AS PRE_BOOKED,SUM(FILLED_DAYOF) AS SCHEDULED_SAMEDAY, SUM(FILLED_AFTER) AS ATTENDED FROM 
+result 
+GROUP BY SCHEDULINGNAME, APPOINTMENTDATE, SPECIALTY, DEPARTMENTNAME)
+--GROUP BY APPOINTMENTDATE)
+
+SELECT *, PRE_BOOKED/NULLIF(TOTAL_SLOTS,0) AS PERCENT_SCHEDULEDAHEAD, ATTENDED/NULLIF(TOTAL_SLOTS,0) AS PERCENT_ATTENDED FROM final--WHERE FILLED_BEFORE != FILLED_AFTER;
+WHERE DEPARTMENTNAME = 'SouthPark8' AND SPECIALTY = 'Internal Medicine'
+-- APPOINTMENTSTARTTIME, APPOINTMENTDATE, FILLED_BEFORE, FILLED_AFTER
+
+-- FILLED_DAYOF/NULLIF((TOTAL_SLOTS-FILLED_BEFORE),0) AS PERCENT_OFUNFILLED_FILLED_DAYOF
+```
+
+
+```{r}
+#Plot filled % at start of day alongside filled day of somehow
+#%unfilled slots to start day of that were filled day of
+#%%filled slots to start the day
+
+library(tidyr)
+df2 <- tidyr::pivot_longer(day_of, cols=c('PERCENT_SCHEDULEDAHEAD', 'PERCENT_ATTENDED'), names_to='variable', 
+values_to="value")
+head(df2)
+
+
+# plot the data using ggplot
+df2 %>%
+  ggplot() +
+  labs(x = "Date",
+    y = "Percentage",
+    title = "Comparing the percent of appointment slots scheduled ahead to the percent of the appointments actually attended",
+    subtitle = "Dates to 2019") + geom_smooth(aes(x = APPOINTMENTDATE, y = value, colour = variable), se=FALSE) 
+```
